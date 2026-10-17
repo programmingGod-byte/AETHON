@@ -67,6 +67,18 @@ constexpr bool kIsLinux = false;
 
 #define AETHON_ERASE AETHON_ALWAYS_INLINE AETHON_ATTR_VISIBILITY_HIDDEN
 
+#if defined(__clang__)
+    #define AETHON_PRAGMA(x) _Pragma(#x)
+    #define AETHON_UNROLL(n) AETHON_PRAGMA(clang loop unroll_count(n))
+#elif defined(__GNUC__)
+    #define AETHON_PRAGMA(x) _Pragma(#x)
+    #define AETHON_UNROLL(n) AETHON_PRAGMA(GCC unroll n)
+#elif defined(_MSC_VER)
+    #define AETHON_UNROLL(n) __pragma(loop(unroll))
+#else
+    #define AETHON_UNROLL(n)
+#endif
+
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__) ||       \
     __has_feature(hwaddress_sanitizer)

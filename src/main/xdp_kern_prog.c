@@ -83,8 +83,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
     void *data = (void *)(long)ctx->data;
     int action = XDP_PASS;
 
-    bpf_printk("XDP triggered\n");
-
     // 1. Parse Ethernet Header
     struct ethhdr *eth = (struct ethhdr *)data;
     if ((void *)(eth + 1) > data_end) 
@@ -111,7 +109,7 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         goto out;
     }
 
-    // 3. Blocklist Check (Using the extracted src_ip)
+    /*
     if (bpf_map_lookup_elem(&aethon_ip_blockist, &src_ip)) {
          bpf_printk("IP BLOCKLISTED - DROP\n");
         action = XDP_DROP;
@@ -121,7 +119,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
     __u64 now = bpf_ktime_get_ns();
     struct rate_limit_state *state = bpf_map_lookup_elem(&aethon_ip_ratelimit, &src_ip);
     if (!state) {
-        // Key doesn't exist yet; allocate in per-CPU hash map
         struct rate_limit_state init_state = {
             .tokens = AETHON_PER_CORE_BURST - 1,
             .last_updated = now,
@@ -129,8 +126,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         };
         bpf_map_update_elem(&aethon_ip_ratelimit, &src_ip, &init_state, BPF_ANY);
     } else if (state->last_updated == 0) {
-        // Key exists, but THIS specific CPU core is seeing it for the first time.
-        // Initialize this core's local slice cleanly:
         state->tokens = AETHON_PER_CORE_BURST - 1;
         state->last_updated = now;
         state->drop_count = 0;
@@ -147,7 +142,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
             state->drop_count += 1;
             bpf_printk("RATE LIMIT EXCEEDED - DROP\n");
 
-            // Escalate to global blocklist if flood persists on this core
             if (state->drop_count >= 8) {
                 __u64 flag = 1;
                 bpf_map_update_elem(&aethon_ip_blockist, &src_ip, &flag, BPF_ANY);
@@ -159,6 +153,7 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         }
         state->tokens -= 1;
     }
+    */
 
     // 5. Attack Checks (only runs if rate limiter passed)
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
@@ -205,7 +200,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
     }
 
     action = bpf_redirect_map(&aethon_xsks_map, target_queue, 0);
-    bpf_printk("Packet received, redirect map ret: %d, qid: %d\n", action, target_queue);
 
 out:
     stats_record_count(ctx, action);

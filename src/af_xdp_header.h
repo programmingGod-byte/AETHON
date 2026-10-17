@@ -51,7 +51,7 @@ template <
     size_t FillRingSize = 2048,
     size_t CompRingSize = 2048,
     size_t MaxQueues = 64,
-    size_t FallbackCapacity = 2048,
+    size_t FallbackCapacity = 4096,
     size_t BatchSize = 64
 >
 struct XdpConfig {
@@ -91,8 +91,12 @@ struct alignas(implementation::hardware_destructive_interference_size) FallbackR
   AETHON_ALWAYS_INLINE bool empty() const noexcept { return head == tail; }
   AETHON_ALWAYS_INLINE size_t size() const noexcept { return head - tail; }
 
-  AETHON_ALWAYS_INLINE void push(uint64_t addr) noexcept {
+  AETHON_ALWAYS_INLINE bool full() const noexcept { return (head - tail) >= Capacity; }
+
+  AETHON_ALWAYS_INLINE bool push(uint64_t addr) noexcept {
+    if (AETHON_UNLIKELY(full())) return false;
     ring[head++ & MASK] = addr;
+    return true;
   }
 
   AETHON_ALWAYS_INLINE uint64_t get(size_t offset = 0) const noexcept {

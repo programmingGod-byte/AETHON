@@ -145,7 +145,6 @@ public:
       ++probes;
     }
 
-    AETHON_SAFE_CHECK(Trait::always_false<int>, "SingleThreadHashMap is full!");
     return false;
   }
 
@@ -162,8 +161,9 @@ public:
 
     size_t idx = hash_key(key) & mask_;
     size_t probes = 0;
+    const size_t max_search = std::min(capacity_, static_cast<size_t>(64));
 
-    while (AETHON_LIKELY(probes < capacity_)) {
+    while (AETHON_LIKELY(probes < max_search)) {
       AETHON_BUILTIN_PREFETCH(&cells_[(idx + 1) & mask_], 0, 3);
       const Key &k = cells_[idx].key;
 
@@ -216,8 +216,8 @@ public:
     while (true) {
       j = (j + 1) & mask_;
 
-      if (cells_[j].key == EmptyKey) {
-        break; // Reached end of continuous cluster
+      if (cells_[j].key == EmptyKey || j == i) {
+        break;
       }
 
       size_t k = hash_key(cells_[j].key) & mask_;

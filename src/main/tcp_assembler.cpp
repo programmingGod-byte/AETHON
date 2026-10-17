@@ -67,6 +67,7 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 #include "aethon/single_thread_hasmap.h"
 #include <array>
 #include <cstddef>
+
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -306,7 +307,7 @@ namespace aethon {
 
             
             AETHON_ALWAYS_INLINE void set_bitmap_range(size_t start, size_t count) noexcept{
-                start&=0xFFF;
+                start&=0xFFFF;
                 while (count>0) {
                     size_t word_idx = start >> 6; // divide by 64
                     size_t bit_offset = start & 63; // % 64
@@ -383,7 +384,7 @@ namespace aethon {
             private:
                  using SessionMap = aethon::SingleThreadHashMap<TcpKey, TcpStreamSession*, KemptyTcpKey, TcpKeyHasher>;
 
-                 SessionMap sessions_{AETHON_MAX_ACTIVE_TCP_SESSION};
+                 SessionMap sessions_{AETHON_MAX_ACTIVE_TCP_SESSION * 2};
                  // we copy and fallten that assembled data out of the ring buffer
                  alignas(implementation::hardware_destructive_interference_size) std::array<uint8_t, AETHON_TCP_WINDOW_SIZE> drain_buf_{};
 
@@ -431,6 +432,19 @@ namespace aethon {
                 }
             }
 
+            void close_session(uint32_t src_ip, uint32_t dst_ip, uint16_t src_port, uint16_t dst_port) noexcept {
+                TcpKey key;
+                key.src_ip = src_ip;
+                key.dst_ip = dst_ip;
+                key.src_port = src_port;
+                key.dst_port = dst_port;
+                TcpStreamSession **slot = sessions_.find(key);
+                if (slot && *slot) {
+                    delete *slot;
+                    sessions_.erase(key);
+                }
+            }
+
             // process packet
 
             AETHON_ALWAYS_INLINE TcpAssemblyResult process_packet(
@@ -469,6 +483,10 @@ namespace aethon {
 
                 const uint8_t flags = reinterpret_cast<const uint8_t *>(tcph)[13];
                 const uint32_t seq   = ntohl(tcph->seq);
+
+                if (AETHON_UNLIKELY((flags & TH_SYN) && !(flags & TH_ACK) && sessions_.size() >= AETHON_MAX_ACTIVE_TCP_SESSION)) {
+                    return result;
+                }
 
                 TcpStreamSession **slot = sessions_.find(key);
                 TcpStreamSession *session = nullptr;

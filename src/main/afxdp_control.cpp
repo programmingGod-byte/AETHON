@@ -18,6 +18,8 @@
 #include <poll.h>
 #include "udp_assembler.cpp"
 #include "ip_address.cpp"
+#include "tcp_pipeline.h"
+
 
 /*
   For IPv4 UDP
@@ -39,6 +41,8 @@ struct alignas(implementation::hardware_destructive_interference_size) CaptureSt
 inline CaptureStats g_stats;
 
 inline std::atomic<bool> g_running{true};
+inline rules::RuleDatabase g_rule_db;
+inline scan::HyperscanEngine g_master_scanner;
 
 static inline void set_cpu_affinity(int core_id) {
   cpu_set_t cpuset;
@@ -112,27 +116,33 @@ void rx_worker(Engine &engine, int queue_id) {
   // Per-worker-thread UDP assembler engine (dedicated Core-pinned instance)
   UDPIpv4Assembler::UDPassemblerEngine assembler;
 
+  IPv4TcpAssembler::TcpAssemblerEngine tcp_assembler;
+  auto scanner = g_master_scanner.create_worker();
+
   while (g_running.load(std::memory_order_relaxed)) {
     uint32_t idx_rx = 0;
     unsigned int rcvd = xsk_ring_cons__peek(&sock->rx, Config::BATCH_SIZE, &idx_rx);
     free_completion_ring(sock);
     
     if (AETHON_UNLIKELY(!rcvd)) {
-        // If we have pending fallback buffers, try to flush them to the Fill Ring now
-        if (!fallback_ring.empty()) {
+        while (!fallback_ring.empty()) {
             uint32_t idx_fq = 0;
-            size_t count = fallback_ring.size();
+            size_t count = std::min(fallback_ring.size(), static_cast<size_t>(Config::BATCH_SIZE));
             size_t available = xsk_ring_prod__reserve(&sock->umen->fq, count, &idx_fq);
-            if (AETHON_LIKELY(available > 0)) {
-                for (size_t i = 0; i < available; ++i) {
-                    *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq + i) = fallback_ring.get(i);
-                }
-                xsk_ring_prod__submit(&sock->umen->fq, available);
-                fallback_ring.advance(available);
+            if (AETHON_UNLIKELY(available == 0)) {
+                break;
             }
+            for (size_t i = 0; i < available; ++i) {
+                *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq + i) = fallback_ring.get(i);
+            }
+            xsk_ring_prod__submit(&sock->umen->fq, available);
+            fallback_ring.advance(available);
         }
 
-        // Put thread to sleep waiting for new packets or fill ring wake-up (reduces idle CPU to ~0%)
+        if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->umen->fq))) {
+            recvfrom(sock_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
+        }
+
         poll(fds, 1, 50);
         continue;
     }
@@ -161,11 +171,12 @@ void rx_worker(Engine &engine, int queue_id) {
 
           // Host IP filter: Accept traffic for our interface private IPs, broadcast, or multicast
           const uint32_t dst_ip = iph->daddr;
-          const bool is_for_this_host = Ipv4::g_host_ips.contains(dst_ip) ||
+          const bool is_for_this_host = (Ipv4::g_host_ips.count == 0) ||
+                                        Ipv4::g_host_ips.contains(dst_ip) ||
                                         (dst_ip == INADDR_BROADCAST) ||
                                         (IN_MULTICAST(ntohl(dst_ip)));
 
-          if (AETHON_LIKELY(is_for_this_host && iph->protocol == IPPROTO_UDP)) {
+          if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(is_for_this_host && iph->protocol == IPPROTO_UDP, 1, 0.15)) {
             uint16_t frag_field = ntohs(iph->frag_off);
             bool more_fragments = (frag_field & IP_MF) != 0;
             uint16_t frag_offset = (frag_field & IP_OFFMASK) * 8;
@@ -183,8 +194,13 @@ void rx_worker(Engine &engine, int queue_id) {
 
                 // Fast Path: Payload available for Hyperscan scanning
                 (void)udph;
-                (void)udp_app_payload;
-                (void)udp_app_len;
+                if (AETHON_LIKELY(udp_app_len > 0)) {
+                  bool is_blocked = scanner.scan(udp_app_payload, udp_app_len);
+                  if (AETHON_UNLIKELY(is_blocked)) {
+                    std::cout << "\n[IPS BLOCK] Malicious UDP Packet Dropped!" << std::endl;
+                    goto recycle_slot;
+                  }
+                }
               }
             } else {
               // Fragmented Packet Path
@@ -202,12 +218,29 @@ void rx_worker(Engine &engine, int queue_id) {
 
               if (AETHON_UNLIKELY(res.is_complete)) {
                 // Reassembled Datagram: Full payload available for Hyperscan scanning
-                (void)res;
+                if (AETHON_LIKELY(res.payload_len > 0)) {
+                  bool is_blocked = scanner.scan(res.payload, res.payload_len);
+                  if (AETHON_UNLIKELY(is_blocked)) {
+                    std::cout << "\n[IPS BLOCK] Malicious Fragmented UDP Packet Dropped!" << std::endl;
+                    assembler.release_completed(res);
+                    goto recycle_slot;
+                  }
+                }
 
                 assembler.release_completed(res);
               }
             }
-          }else if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(is_for_this_host && iph->protocol==IPPROTO_ICMP,1,0.01)){
+          } else if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(is_for_this_host && iph->protocol == IPPROTO_TCP, 1, 0.85)) {
+            const size_t ip_total_len = ntohs(iph->tot_len);
+            uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+
+            bool is_blocked = pipeline::handle_tcp_packet(
+                sock, desc->addr, pkt, eth, iph, ip_total_len, now_ns, tcp_assembler, scanner);
+            if (AETHON_UNLIKELY(is_blocked)) {
+              continue;
+            }
+          } else if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(is_for_this_host && iph->protocol == IPPROTO_ICMP, 1, 0.01)) {
             const size_t ip_hdr_len=iph->ihl*4;
             if (AETHON_UNLIKELY(ip_hdr_len<sizeof(struct iphdr))) goto recycle_slot;
             const size_t ip_total_len=ntohs(iph->tot_len);
@@ -248,7 +281,13 @@ void rx_worker(Engine &engine, int queue_id) {
 
 recycle_slot:
       batch_bytes += desc->len;
-      fallback_ring.push(desc->addr);
+      if (AETHON_UNLIKELY(!fallback_ring.push(desc->addr))) {
+        uint32_t idx_fq = 0;
+        if (xsk_ring_prod__reserve(&sock->umen->fq, 1, &idx_fq) == 1) {
+          *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq) = desc->addr;
+          xsk_ring_prod__submit(&sock->umen->fq, 1);
+        }
+      }
     }
 
     // Update atomic counters (relaxed ordering for low contention)
@@ -258,18 +297,22 @@ recycle_slot:
     // Release the consumed descriptors in the RX ring
     xsk_ring_cons__release(&sock->rx, rcvd);
 
-    // Refill the Fill Ring with our recycled buffer addresses
-    if (!fallback_ring.empty()) {
+    while (!fallback_ring.empty()) {
       uint32_t idx_fq = 0;
-      size_t count = fallback_ring.size();
+      size_t count = std::min(fallback_ring.size(), static_cast<size_t>(Config::BATCH_SIZE));
       size_t available = xsk_ring_prod__reserve(&sock->umen->fq, count, &idx_fq);
-      if (AETHON_LIKELY(available > 0)) {
-        for (size_t i = 0; i < available; ++i) {
-          *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq + i) = fallback_ring.get(i);
-        }
-        xsk_ring_prod__submit(&sock->umen->fq, available);
-        fallback_ring.advance(available);
+      if (AETHON_UNLIKELY(available == 0)) {
+        break;
       }
+      for (size_t i = 0; i < available; ++i) {
+        *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq + i) = fallback_ring.get(i);
+      }
+      xsk_ring_prod__submit(&sock->umen->fq, available);
+      fallback_ring.advance(available);
+    }
+
+    if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->umen->fq))) {
+      recvfrom(sock_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
     }
   }
 }
@@ -294,7 +337,8 @@ inline void stats_printer() {
     double mbps = (bps * 8.0) / 1000000.0; // Megabits per second
 
     std::cout << "\r[Stats] Speed: " << pps << " pps | " 
-              << std::fixed << std::setprecision(2) << mbps << " Mbps" << std::flush;
+              << std::fixed << std::setprecision(2) << mbps << " Mbps | Total: "
+              << current_packets << " pkts" << std::flush;
 
     last_packets = current_packets;
     last_bytes = current_bytes;
@@ -328,6 +372,23 @@ int main(int argc, char **argv) {
 
   // Discover and cache all local IPv4 addresses on this interface (AWS private IPs)
   aethon::Ipv4::load_interface_ips(ifname);
+
+  size_t rules_count = g_rule_db.load_from_file("rules/emerging-sql.rules");
+  if (rules_count == 0) {
+    rules_count = g_rule_db.load_from_file("../../rules/emerging-sql.rules");
+  }
+  std::cout << "Loaded " << rules_count << " Snort/Suricata rules.\n";
+  if (!g_rule_db.empty()) {
+    g_master_scanner.set_alert_callback([](const aethon::scan::AttackAlert &alert) {
+      std::cout << "\n[ALERT] Threat Detected! SID: " << alert.sid;
+      if (alert.rule) {
+        std::cout << " | Msg: " << alert.rule->msg;
+      }
+      std::cout << std::endl;
+    });
+    g_master_scanner.compile_rules(g_rule_db);
+    std::cout << "Compiled " << g_master_scanner.rule_count() << " rules into master Hyperscan database.\n";
+  }
 
   std::cout << "Starting AF_XDP on interface: " << ifname << "\n";
   std::cout << "Using eBPF Program: " << prog_path << "\n";

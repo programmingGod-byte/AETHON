@@ -36,3 +36,15 @@ add_executable(raw_socket_baseline main/raw_socket_baseline.cpp)
 target_link_libraries(raw_socket_baseline PRIVATE pthread)
 target_compile_options(raw_socket_baseline PRIVATE -Wall -Wextra -pthread)
 
+add_executable(max_power_blaster ../tests/max_power_blaster.cpp)
+target_link_libraries(max_power_blaster PRIVATE pthread)
+target_compile_options(max_power_blaster PRIVATE -O3 -Wall -Wextra -pthread)
+
+add_executable(chaos_torture_test ../tests/chaos_torture_test.cpp)
+target_link_libraries(chaos_torture_test PRIVATE pthread)
+target_compile_options(chaos_torture_test PRIVATE -O3 -Wall -Wextra -pthread)
+
+add_executable(stateful_exploit_torture ../tests/stateful_exploit_torture.cpp)
+target_link_libraries(stateful_exploit_torture PRIVATE pthread)
+target_compile_options(stateful_exploit_torture PRIVATE -O3 -Wall -Wextra -pthread)
+

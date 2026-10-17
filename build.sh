@@ -7,6 +7,11 @@ cd "$ROOT_DIR"
 
 BUILD_TYPE="Debug"
 
+CMAKE_BIN="cmake"
+if [ -x /usr/bin/cmake ]; then
+  CMAKE_BIN="/usr/bin/cmake"
+fi
+
 # Parse optional arguments
 for arg in "$@"; do
   case $arg in
@@ -29,10 +34,10 @@ for arg in "$@"; do
 done
 
 echo "🔧 Configuring project (${BUILD_TYPE})..."
-cmake -B build -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+"$CMAKE_BIN" -B build -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
 
 echo "🚀 Compiling with all available cores..."
-cmake --build build -j
+"$CMAKE_BIN" --build build -j
 
 echo "✅ Build completed successfully!"
 echo "   - Library:       build/aethon/libaethon_lib.a"

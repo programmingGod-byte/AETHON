@@ -18,19 +18,32 @@ set(CLI11_BUILD_TESTS OFF CACHE INTERNAL "")
 set(CLI11_BUILD_EXAMPLES OFF CACHE INTERNAL "")
 set(CLI11_BUILD_DOCS OFF CACHE INTERNAL "")
 
-FetchContent_Declare(
-    CLI11
-    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-    GIT_TAG        v2.4.2
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/CLI11/CMakeLists.txt")
+    FetchContent_Declare(
+        CLI11
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/extern/CLI11
+    )
+else()
+    FetchContent_Declare(
+        CLI11
+        GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+        GIT_TAG        v2.4.2
+    )
+endif()
 
-# Declare FluxIO from GitHub
 set(FLUXIO_BUILD_PYTHON OFF CACHE INTERNAL "")
-FetchContent_Declare(
-    FluxIO
-    GIT_REPOSITORY https://github.com/programmingGod-byte/FluxIO.git
-    GIT_TAG        main
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/FluxIO/CMakeLists.txt")
+    FetchContent_Declare(
+        FluxIO
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/extern/FluxIO
+    )
+else()
+    FetchContent_Declare(
+        FluxIO
+        GIT_REPOSITORY https://github.com/programmingGod-byte/FluxIO.git
+        GIT_TAG        main
+    )
+endif()
 FetchContent_MakeAvailable(CLI11 FluxIO)
 
 # Create app & link FluxIO

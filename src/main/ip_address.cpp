@@ -43,7 +43,7 @@ inline void load_interface_ips(const char *__restrict__ ifname) noexcept {
       continue;
     }
 
-    if (std::memcmp(ifa->ifa_name, ifname, IFNAMSIZ) == 0) {
+    if (std::strcmp(ifa->ifa_name, ifname) == 0) {
       if (AETHON_LIKELY(g_host_ips.count < 8)) {
         const auto *sa =
             reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_addr);

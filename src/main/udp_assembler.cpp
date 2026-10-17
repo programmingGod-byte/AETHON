@@ -222,7 +222,7 @@ struct AssemblyResult {
 class UDPassemblerEngine {
 private:
   using SessionMap = aethon::SingleThreadHashMap<FragmentKey, ReassemblySession*, kEmptyFragmentKey, FragmentKeyHasher>;
-  SessionMap sessions_{AETHON_MAX_ACTIVE_DGRAM_SESSIONS};
+  SessionMap sessions_{AETHON_MAX_ACTIVE_DGRAM_SESSIONS * 2};
   uint64_t last_cleanup_ns_{0};
 
 public:
