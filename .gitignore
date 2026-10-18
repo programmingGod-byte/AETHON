@@ -1,4 +1,5 @@
 build/
+_deps/
 .cache/
 PRODUCTION_ARCHITECTURE.md*.gch
 *.gch

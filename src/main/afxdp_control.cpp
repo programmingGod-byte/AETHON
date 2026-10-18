@@ -19,6 +19,10 @@
 #include "udp_assembler.cpp"
 #include "ip_address.cpp"
 #include "tcp_pipeline.h"
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 
 /*
@@ -72,7 +76,7 @@ static inline void free_completion_ring(aethon_xsk_socket_info* sock){
   uint32_t idx_fq=0;
   unsigned int avail=xsk_ring_prod__reserve(&sock->umen->fq,completed,&idx_fq);
   if (AETHON_UNLIKELY(avail==0)) return;
-  for (int i=0;i<avail;i++){
+  for (unsigned int i = 0; i < avail; ++i) {
     uint64_t addr=*xsk_ring_cons__comp_addr(&sock->umen->cq,idx+i);
     *xsk_ring_prod__fill_addr(&sock->umen->fq,idx_fq+i)=addr;
   }
@@ -345,12 +349,37 @@ inline void stats_printer() {
   }
 }
 
+using ActiveEngine = DefaultEngine;
+
+
+template <typename Engine>
+void pin_xdp_map([[maybe_unused]] Engine& engine, struct bpf_map* map, const char* name) {
+    if (!map) {
+        std::cerr << "\nNo XDP map provided\n";
+        return;
+    }
+    constexpr const char* pin_dir = "/sys/fs/bpf/aethon";
+    if (mkdir(pin_dir, 0755) != 0 && errno != EEXIST) {
+        perror("Failed to create BPF pin directory");
+        return;
+    }
+    std::string pin_path = std::string(pin_dir) + "/" + name;
+    int err = bpf_map__pin(map, pin_path.c_str());
+    if (err == 0) {
+        std::cout << "\n[Engine] Map '" << name << "' pinned successfully\n";
+    } else if (err == -EEXIST) {
+        std::cout << "\n[Engine] Map '" << name << "' is already pinned\n";
+    } else {
+        std::cerr << "[Engine] Failed to pin map '" << name << "': " << err << '\n';
+    }
+}
+
+
 // ============================================================================
 // PARAMETER CONFIGURATION
 // ============================================================================
 // DefaultEngine uses XdpConfig with 4096 frames (8MB UMEM), 2048 ring sizes, 64 batch.
 // You can define custom configs here if needed.
-using ActiveEngine = DefaultEngine;
 
 static void sig_handler(int) {
   g_running.store(false, std::memory_order_relaxed);
@@ -416,7 +445,9 @@ int main(int argc, char **argv) {
   for (auto &w : workers) {
     w.join();
   }
-
+  pin_xdp_map(engine,engine.find_map("aethon_ip_blockist"),"aethon_ip_blockist");
+  pin_xdp_map(engine,engine.find_map("aethon_rate_limiter"),"aethon_rate_limiter");
+  pin_xdp_map(engine,engine.find_map("rate_limiter_params"),"rate_limiter_params");
   std::cout << "\n[Engine] Gracefully stopped all workers.\n";
   return 0;
 }

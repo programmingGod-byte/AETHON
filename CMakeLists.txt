@@ -31,11 +31,18 @@ else()
     )
 endif()
 
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Don't update dependencies on reconfigure")
+
 set(FLUXIO_BUILD_PYTHON OFF CACHE INTERNAL "")
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/FluxIO/CMakeLists.txt")
     FetchContent_Declare(
         FluxIO
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/extern/FluxIO
+    )
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/_deps/fluxio-src/CMakeLists.txt")
+    FetchContent_Declare(
+        FluxIO
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/_deps/fluxio-src
     )
 else()
     FetchContent_Declare(

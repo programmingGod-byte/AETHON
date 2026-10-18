@@ -4,10 +4,19 @@ pkg_check_modules(LIBBPF REQUIRED libbpf)
 
 pkg_check_modules(LIBHS REQUIRED libhs)
 
+# Determine host architecture include directory for BPF compilation
+if(EXISTS "/usr/include/${CMAKE_LIBRARY_ARCHITECTURE}")
+    set(BPF_ARCH_INCLUDE "-I/usr/include/${CMAKE_LIBRARY_ARCHITECTURE}")
+elseif(EXISTS "/usr/include/x86_64-linux-gnu")
+    set(BPF_ARCH_INCLUDE "-I/usr/include/x86_64-linux-gnu")
+else()
+    set(BPF_ARCH_INCLUDE "")
+endif()
+
 # Compile eBPF program
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/main/xdp_kern_prog.o
-    COMMAND clang -O2 -g -target bpf -D__BPF_TRACING__ -I/usr/include -c ${CMAKE_CURRENT_SOURCE_DIR}/main/xdp_kern_prog.c -o ${CMAKE_CURRENT_SOURCE_DIR}/main/xdp_kern_prog.o
+    COMMAND clang -O2 -g -target bpf -D__BPF_TRACING__ -I/usr/include ${BPF_ARCH_INCLUDE} -c ${CMAKE_CURRENT_SOURCE_DIR}/main/xdp_kern_prog.c -o ${CMAKE_CURRENT_SOURCE_DIR}/main/xdp_kern_prog.o
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/main/xdp_kern_prog.c
     VERBATIM
 )

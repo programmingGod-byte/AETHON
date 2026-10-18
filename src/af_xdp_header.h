@@ -242,13 +242,48 @@ public:
       }
     }
 
-    // 1. Load eBPF Object
-    bpf_obj_ = bpf_object__open_file(resolved_prog.c_str(), NULL);
-    if (!bpf_obj_ || bpf_object__load(bpf_obj_)) {
-      std::cerr << "Error: Cannot open or load eBPF program from " << resolved_prog << "\n";
-      return false;
-    }
+   // 1. Open eBPF object (do not load it yet)
+  bpf_obj_ = bpf_object__open_file(resolved_prog.c_str(), nullptr);
 
+  long open_err = libbpf_get_error(bpf_obj_);
+  if (open_err) {
+      bpf_obj_ = nullptr;
+      std::cerr << "Error opening BPF object: "
+                << open_err << '\n';
+      return false;
+  }
+  bool reused_blockist = false;
+  if (!load_xdp_map(bpf_obj_, "aethon_ip_blockist", "/sys/fs/bpf/aethon/aethon_ip_blockist", reused_blockist))
+    return false;
+
+  bool reused_rate_limiter = false;
+  if (!load_xdp_map(bpf_obj_, "aethon_rate_limiter", "/sys/fs/bpf/aethon/aethon_rate_limiter", reused_rate_limiter))
+    return false;
+
+  bool reused_params = false;
+  if (!load_xdp_map(bpf_obj_, "rate_limiter_params", "/sys/fs/bpf/aethon/rate_limiter_params", reused_params))
+    return false;
+
+  if (bpf_object__load(bpf_obj_) != 0) {
+      std::cerr << "Error loading eBPF object from " << resolved_prog << '\n';
+      return false;
+  }
+  
+  struct bpf_map *rate_limiter_params = bpf_object__find_map_by_name(bpf_obj_, "rate_limiter_params");
+  if (rate_limiter_params) {
+    int params_fd = bpf_map__fd(rate_limiter_params);
+    if (params_fd >= 0) {
+      uint16_t TOKEN = 1;
+      uint16_t WINDOW = 2;
+      uint16_t LIMIT = 3;
+      uint64_t valueT = 10;
+      uint64_t valueW = 10;
+      uint64_t valueL = 10;
+      bpf_map_update_elem(params_fd, &TOKEN, &valueT, BPF_NOEXIST);
+      bpf_map_update_elem(params_fd, &WINDOW, &valueW, BPF_NOEXIST);
+      bpf_map_update_elem(params_fd, &LIMIT, &valueL, BPF_NOEXIST);
+    }
+  }
     // Pass queue count to eBPF map
     struct bpf_map *config_map =
         bpf_object__find_map_by_name(bpf_obj_, queue_config_map_name);
@@ -394,6 +429,12 @@ public:
     }
     total_active_queues_ = 0;
   }
+  struct bpf_map *find_map(const char *name) noexcept {
+    if (!bpf_obj_ || !name)
+        return nullptr;
+
+    return bpf_object__find_map_by_name(bpf_obj_, name);
+  }
 
   int active_queues() const noexcept { return total_active_queues_; }
   const std::string &interface() const noexcept { return ifname_; }
@@ -406,6 +447,43 @@ public:
   }
 
 private:
+  inline bool load_xdp_map(
+      struct bpf_object* obj,
+      const char* map_name,
+      const char* pin_path,
+      bool& reused)
+  {
+      reused = false;
+      if (!obj || !map_name || !pin_path) {
+          std::cerr << "Invalid argument to load_xdp_map\n";
+          return false;
+      }
+      struct bpf_map* map =bpf_object__find_map_by_name(obj, map_name);
+      if (!map) {
+          std::cerr << "Map not found in BPF object: "<< map_name << '\n';
+          return false;
+      }
+      int fd = bpf_obj_get(pin_path);
+      if (fd < 0) {
+          if (errno == ENOENT) {
+              std::cout << "\n[MapPersistence] No pinned map at "<< pin_path << "; using a new map\n";
+              return true;
+          }
+
+          perror("bpf_obj_get");
+          return false;
+      }
+      int err = bpf_map__reuse_fd(map, fd);
+      close(fd);
+      if (err != 0) {
+          std::cerr << "\n[MapPersistence] Failed to reuse "<< map_name << ": " << err << '\n';
+          return false;
+      }
+      reused = true;
+      std::cout << "\n[MapPersistence] Reusing pinned map: "<< map_name << '\n';
+      return true;
+  }
+
   std::optional<aethon_umen_info *> configure_umen() {
     auto *umen = static_cast<aethon_umen_info *>(calloc(1, sizeof(*umen)));
     if (!umen) {

@@ -1,0 +1,1 @@
+sudo ip netns exec client_ns ping -c 300 -i 0.01 192.168.50.1

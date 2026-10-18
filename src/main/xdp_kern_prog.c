@@ -13,6 +13,8 @@
 #define AETHON_PER_CORE_BURST 10ULL
 #define AETHON_PER_CORE_REFILL_PER_SEC 2ULL
 #define AETHON_MAX_XDP_RETURN_TYPE 5
+#define AETHON_MAX_RATE_LIMIT_PARAMETER 3
+
 
 // getting the no of queeu map
 struct {
@@ -30,11 +32,38 @@ struct {
     __type(value, __u64);
 } aethon_ip_blockist SEC(".maps");
 
-// Lockless per-CPU rate limiting state struct
-struct rate_limit_state {
+struct{
+    __uint(type,BPF_MAP_TYPE_HASH);
+    __uint(max_entries,AETHON_MAX_IPS);
+    __type(key,struct aethon_ip_address);
+    __type(value,__u16);
+} aethon_rate_limiter SEC(".maps");
+
+struct{
+    __uint(type,BPF_MAP_TYPE_HASH);
+    __uint(max_entries,AETHON_MAX_RATE_LIMIT_PARAMETER);
+    __type(key,__u16);
+    __type(value,__u64);
+} rate_limiter_params SEC(".maps");
+
+struct token_bucket_state{
     __u64 tokens;
     __u64 last_updated;
     __u64 drop_count;
+};
+
+struct sliding_window_state{
+    __u64 last_time;
+    __u64 packets;
+    __u64 drop_count;
+    __u64 limit;
+    __u64 window; 
+};
+// Lockless per-CPU rate limiting state struct
+struct rate_limit_state {
+    struct token_bucket_state token_bucket;
+    struct sliding_window_state sliding_window_limiter;
+    __u64 algo;  
 };
 
 // 100% Lock-Free Per-CPU map (Zero cross-core lock contention!)
@@ -77,6 +106,91 @@ static aethon_always_inline void stats_record_count(struct xdp_md * ctx, __u32 a
         rec->rx_packets+=1;
     }
 }
+static aethon_always_inline int token_bucket(struct aethon_ip_address* src_ip, struct rate_limit_state* state, __u64 tokens) {
+    __u64 now = bpf_ktime_get_ns();
+    if (!state) {
+        struct rate_limit_state init_state = {
+            .token_bucket = {
+                .tokens = (tokens > 0) ? (tokens - 1) : 0,
+                .last_updated = now,
+                .drop_count = 0
+            },
+            .sliding_window_limiter = {},
+            .algo = 0
+        };
+        bpf_map_update_elem(&aethon_ip_ratelimit, src_ip, &init_state, BPF_ANY);
+        return (tokens > 0) ? 1 : 0;
+    } else if (state->token_bucket.last_updated == 0) {
+        state->token_bucket.tokens = (tokens > 0) ? (tokens - 1) : 0;
+        state->token_bucket.last_updated = now;
+        state->token_bucket.drop_count = 0;
+        return (tokens > 0) ? 1 : 0;
+    } else {
+        __u64 elapsed = now - state->token_bucket.last_updated;
+        __u64 tokens_to_add = (elapsed * AETHON_PER_CORE_REFILL_PER_SEC) / SECOND_NS;
+        if (tokens_to_add > 0) {
+            __u64 new_tokens = state->token_bucket.tokens + tokens_to_add;
+            state->token_bucket.tokens = (new_tokens > tokens) ? tokens : new_tokens;
+            state->token_bucket.last_updated = now;
+        }
+
+        if (state->token_bucket.tokens == 0) {
+            state->token_bucket.drop_count += 1;
+            bpf_printk("RATE LIMIT EXCEEDED - DROP\n");
+
+            if (state->token_bucket.drop_count >= 8) {
+                __u64 flag = 1;
+                bpf_map_update_elem(&aethon_ip_blockist, src_ip, &flag, BPF_ANY);
+                bpf_printk("IP BLOCKLISTED DUE TO FLOOD\n");
+            }
+
+            return 0;
+        }
+        state->token_bucket.tokens -= 1;
+    }
+    return 1;
+}
+
+static aethon_always_inline int sliding_window_limiter(struct aethon_ip_address* src_ip, struct rate_limit_state* state, __u64 limit, __u64 window) {
+    __u64 now = bpf_ktime_get_ns();
+    if (!state) {
+        struct rate_limit_state init_state = {
+            .token_bucket = {},
+            .sliding_window_limiter = {
+                .limit = limit,
+                .drop_count = 0,
+                .packets = 1,
+                .last_time = now,
+                .window = window
+            },
+            .algo = 1
+        };
+        bpf_map_update_elem(&aethon_ip_ratelimit, src_ip, &init_state, BPF_ANY);
+        return (limit >= 1) ? 1 : 0;
+    } else if (state->sliding_window_limiter.last_time == 0 ||
+               (now - state->sliding_window_limiter.last_time >= state->sliding_window_limiter.window * SECOND_NS)) {
+        state->sliding_window_limiter.limit = limit;
+        state->sliding_window_limiter.window = window;
+        state->sliding_window_limiter.packets = 1;
+        state->sliding_window_limiter.drop_count = 0;
+        state->sliding_window_limiter.last_time = now;
+        return (limit >= 1) ? 1 : 0;
+    } else {
+        if (state->sliding_window_limiter.packets >= state->sliding_window_limiter.limit) {
+            state->sliding_window_limiter.drop_count++;
+            bpf_printk("RATE LIMIT EXCEEDED - DROP\n");
+            if (state->sliding_window_limiter.drop_count >= 8) {
+                __u64 flag = 1;
+                bpf_map_update_elem(&aethon_ip_blockist, src_ip, &flag, BPF_ANY);
+                bpf_printk("IP BLOCKLISTED DUE TO FLOOD\n");
+            }
+            return 0;
+        }
+        state->sliding_window_limiter.packets++;
+    }
+    return 1;
+}
+
 SEC("xdp")
 int aethon_xdp_prog_main(struct xdp_md * ctx) {
     void *data_end = (void *)(long)ctx->data_end;
@@ -108,52 +222,53 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         action = XDP_PASS;
         goto out;
     }
-
-    /*
+    // 3. Check IP Blocklist First: Drop immediately if blocklisted
     if (bpf_map_lookup_elem(&aethon_ip_blockist, &src_ip)) {
-         bpf_printk("IP BLOCKLISTED - DROP\n");
+        bpf_printk("IP BLOCKLISTED - DROP\n");
         action = XDP_DROP;
         goto out;
     }
 
-    __u64 now = bpf_ktime_get_ns();
-    struct rate_limit_state *state = bpf_map_lookup_elem(&aethon_ip_ratelimit, &src_ip);
-    if (!state) {
-        struct rate_limit_state init_state = {
-            .tokens = AETHON_PER_CORE_BURST - 1,
-            .last_updated = now,
-            .drop_count = 0
-        };
-        bpf_map_update_elem(&aethon_ip_ratelimit, &src_ip, &init_state, BPF_ANY);
-    } else if (state->last_updated == 0) {
-        state->tokens = AETHON_PER_CORE_BURST - 1;
-        state->last_updated = now;
-        state->drop_count = 0;
+    // 4. Rate Limiter Configuration & Lookup
+    __u16 key_token = 1;
+    __u16 key_window = 2;
+    __u16 key_limit = 3;
+    __u64* tokens_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_token);
+    __u64* limit_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_limit);
+    __u64* window_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_window);
+
+    __u64 tokens_val = tokens_ptr ? *tokens_ptr : AETHON_PER_CORE_BURST;
+    __u64 limit_val = limit_ptr ? *limit_ptr : 10;
+    __u64 window_val = window_ptr ? *window_ptr : 10;
+
+    __u16* algo_ptr = bpf_map_lookup_elem(&aethon_rate_limiter, &src_ip);
+    __u16 algo = 0;
+    if (!algo_ptr) {
+        __u16 default_algo = 0;
+        bpf_map_update_elem(&aethon_rate_limiter, &src_ip, &default_algo, BPF_ANY);
+        algo = 0;
     } else {
-        __u64 elapsed = now - state->last_updated;
-        __u64 tokens_to_add = (elapsed * AETHON_PER_CORE_REFILL_PER_SEC) / SECOND_NS;
-        if (tokens_to_add > 0) {
-            __u64 new_tokens = state->tokens + tokens_to_add;
-            state->tokens = (new_tokens > AETHON_PER_CORE_BURST) ? AETHON_PER_CORE_BURST : new_tokens;
-            state->last_updated = now;
-        }
-
-        if (state->tokens == 0) {
-            state->drop_count += 1;
-            bpf_printk("RATE LIMIT EXCEEDED - DROP\n");
-
-            if (state->drop_count >= 8) {
-                __u64 flag = 1;
-                bpf_map_update_elem(&aethon_ip_blockist, &src_ip, &flag, BPF_ANY);
-                bpf_printk("IP BLOCKLISTED DUE TO FLOOD\n");
-            }
-
-            action = XDP_DROP;
-            goto out;
-        }
-        state->tokens -= 1;
+        algo = *algo_ptr;
     }
-    */
+
+    struct rate_limit_state* state = bpf_map_lookup_elem(&aethon_ip_ratelimit, &src_ip);
+    int resp = 1;
+    if (algo == 0) {
+        resp = token_bucket(&src_ip, state, tokens_val);
+    } else if (algo == 1) {
+        resp = sliding_window_limiter(&src_ip, state, limit_val, window_val);
+    } else {
+        __u16 reset_algo = 0;
+        bpf_map_update_elem(&aethon_rate_limiter, &src_ip, &reset_algo, BPF_ANY);
+        resp = token_bucket(&src_ip, state, tokens_val);
+    }
+
+    if (!resp) {
+        action = XDP_DROP;
+        goto out;
+    }
+
+    
 
     // 5. Attack Checks (only runs if rate limiter passed)
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
