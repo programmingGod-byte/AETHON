@@ -8,6 +8,7 @@ echo "🧹 1. Cleaning up any old network setups..."
 # Ignore errors if they don't exist yet
 sudo ip link delete veth0 2>/dev/null
 sudo ip netns delete client_ns 2>/dev/null
+sudo rm -rf /sys/fs/bpf/aethon 2>/dev/null || true
 
 
 echo "🏗️ 2. Creating isolated Network Namespace (client_ns)..."

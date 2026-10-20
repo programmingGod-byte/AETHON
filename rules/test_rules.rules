@@ -1,0 +1,4 @@
+alert tcp any any -> any any (msg:"AETHON ATTACK /etc/passwd Detected"; content:"/etc/passwd"; nocase; sid:1001; rev:1;)
+alert tcp any any -> any any (msg:"AETHON ATTACK MySQL Dump Detected"; content:"mysql.user"; nocase; sid:2014910; rev:1;)
+alert tcp any any -> any any (msg:"AETHON ATTACK xp_cmdshell"; content:"xp_cmdshell"; nocase; sid:2100681; rev:1;)
+

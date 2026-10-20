@@ -276,12 +276,12 @@ public:
       uint16_t TOKEN = 1;
       uint16_t WINDOW = 2;
       uint16_t LIMIT = 3;
-      uint64_t valueT = 10;
-      uint64_t valueW = 10;
-      uint64_t valueL = 10;
-      bpf_map_update_elem(params_fd, &TOKEN, &valueT, BPF_NOEXIST);
-      bpf_map_update_elem(params_fd, &WINDOW, &valueW, BPF_NOEXIST);
-      bpf_map_update_elem(params_fd, &LIMIT, &valueL, BPF_NOEXIST);
+      uint64_t valueT = 100000ULL;
+      uint64_t valueW = 10ULL;
+      uint64_t valueL = 50000ULL;
+      bpf_map_update_elem(params_fd, &TOKEN, &valueT, BPF_ANY);
+      bpf_map_update_elem(params_fd, &WINDOW, &valueW, BPF_ANY);
+      bpf_map_update_elem(params_fd, &LIMIT, &valueL, BPF_ANY);
     }
   }
     // Pass queue count to eBPF map

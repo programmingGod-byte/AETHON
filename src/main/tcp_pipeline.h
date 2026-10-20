@@ -4,11 +4,18 @@
 #include "tcp_assembler.cpp"
 #include "hyper_scan_engine.h"
 #include "packet_injector.h"
+#include <cstddef>
+#include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <cstdint>
 #include <iostream>
+#include <sys/types.h>
+#include "tls_engine.h"
+#include "tls_parser.h"
+#include "domain_blocklist.h"
+#include "service_registry.h"
 
 namespace aethon {
 namespace pipeline {
@@ -23,6 +30,9 @@ namespace pipeline {
             std::cout << "unknown";
         }
     }
+
+    inline dns::DomainBlocklist g_domain_blocklist;
+    inline service::ServiceRegistry g_service_registry;
 
     template <typename Scanner>
     AETHON_ALWAYS_INLINE bool handle_tcp_packet(
@@ -63,21 +73,119 @@ namespace pipeline {
             iph, tcph, payload, payload_len, now_ns);
 
         if (AETHON_LIKELY(res.is_ready && res.payload_len > 0)) {
-            bool attack_detected = scanner.scan(res.payload, res.payload_len);
+            auto tls_info = tls::parse_client_hello(res.payload, res.payload_len);
 
-            if (AETHON_UNLIKELY(attack_detected)) {
-                std::cout << "\n[IPS BLOCK] Malicious TCP Packet Dropped!" << std::endl;
-                std::cout << "  Attacker : ";
-                print_ip(iph->saddr);
-                std::cout << ":" << ntohs(tcph->source) << std::endl;
-                std::cout << "  Target   : ";
-                print_ip(iph->daddr);
-                std::cout << ":" << ntohs(tcph->dest) << std::endl;
+            if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(tls_info.is_client_hello, 1, 0.02)) {
+                if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
+                    std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
+                    std::cout << "  Attacker : ";
+                    print_ip(iph->saddr);
+                    std::cout << ":" << ntohs(tcph->source) << std::endl;
+                    std::cout << "  Target   : ";
+                    print_ip(iph->daddr);
+                    std::cout << ":" << ntohs(tcph->dest) << std::endl;
 
-                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
-                bool rst_sent = net::PacketInjector::ipv4_send_tcp_rst(
-                    sock, buf_addr, pkt, eth, iph, tcph, payload_len);
-                return rst_sent;
+                    tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    return net::PacketInjector::ipv4_send_tcp_rst(
+                        sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                }
+
+                if (res.session) {
+                    const auto * svc = g_service_registry.find_by_domain(tls_info.sni);
+                    if (!svc) {
+                        svc = g_service_registry.find_by_ip_port(iph->daddr, ntohs(tcph->dest));
+                    }
+                    if (svc && svc->ssl_ctx) {
+                        res.session->tls_conn.init(svc->ssl_ctx);
+                        res.session->backend_port = svc->backend_port;
+                    }
+                }
+            }
+
+            if (res.session && res.session->tls_conn.status() != tls::TlsSessionStatus::IDLE) {
+                res.session->tls_conn.feed_network_data(res.payload, res.payload_len);
+
+                if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
+                    res.session->tls_conn.step_handshake();
+                    uint8_t tx_buf[16384];
+                    int tx_len = res.session->tls_conn.read_pending_tx(tx_buf, sizeof(tx_buf));
+                    if (tx_len > 0) {
+                        net::PacketInjector::ipv4_send_tcp_data(
+                            sock, buf_addr, pkt, eth, iph, tcph,
+                            res.session->rcv_nxt, ntohl(tcph->seq) + payload_len,
+                            tx_buf, tx_len);
+                        return true;
+                    }
+                }
+
+                if (res.session->tls_conn.is_established()) {
+                    uint8_t plain_buf[16384];
+                    int plain_len = res.session->tls_conn.decrypt(plain_buf, sizeof(plain_buf));
+                    if (plain_len > 0) {
+                        bool attack_detected = scanner.scan(plain_buf, plain_len);
+                        if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(attack_detected, 1, 0.0001)) {
+                            std::cout << "\n[IPS BLOCK] Malicious Decrypted TLS Payload Dropped!" << std::endl;
+                            std::cout << "  Attacker : ";
+                            print_ip(iph->saddr);
+                            std::cout << ":" << ntohs(tcph->source) << std::endl;
+                            std::cout << "  Target   : ";
+                            print_ip(iph->daddr);
+                            std::cout << ":" << ntohs(tcph->dest) << std::endl;
+
+                            tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            return net::PacketInjector::ipv4_send_tcp_rst(
+                                sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                        }else{
+                            uint16_t target_port = res.session->backend_port;
+                            if(target_port == 0){
+                                const auto *svc = g_service_registry.find_by_ip_port(iph->daddr, ntohs(tcph->dest));
+                                if(svc) target_port = svc->backend_port;
+                            }
+                            if(target_port > 0){
+                                res.session->forward_to_backend(plain_buf, plain_len, target_port);
+                            }
+                        }
+                    }
+                }
+
+                if(res.session && res.session->backend_fd >=0 ){
+                    uint8_t resp_buf[16384];
+                    ssize_t resp_len = res.session->read_from_backend(resp_buf, sizeof(resp_buf));
+                    if(resp_len > 0){
+                        res.session->tls_conn.encrypt(resp_buf, static_cast<size_t>(resp_len));
+                        uint8_t enc_tx[16384];
+                        int enc_len = res.session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
+                        if(enc_len > 0){
+                            net::PacketInjector::ipv4_send_tcp_data(sock, buf_addr, pkt, eth, iph, tcph, res.session->rcv_nxt, ntohl(tcph->seq) + payload_len, enc_tx, enc_len);
+                            return true;
+                        }
+                    }
+                }
+            } else {
+                bool attack_detected = scanner.scan(res.payload, res.payload_len);
+                if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(attack_detected, 1, 0.0001)) {
+                    std::cout << "\n[IPS BLOCK] Malicious TCP Packet Dropped!" << std::endl;
+                    std::cout << "  Attacker : ";
+                    print_ip(iph->saddr);
+                    std::cout << ":" << ntohs(tcph->source) << std::endl;
+                    std::cout << "  Target   : ";
+                    print_ip(iph->daddr);
+                    std::cout << ":" << ntohs(tcph->dest) << std::endl;
+
+                    tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    return net::PacketInjector::ipv4_send_tcp_rst(
+                        sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                }else{
+                    uint16_t target_port = res.session ? res.session->backend_port : 0;
+                    if(target_port == 0){
+                        const auto *svc =g_service_registry.find_by_ip_port(iph->daddr, ntohs(tcph->dest));
+                        if(svc) target_port = svc->backend_port;
+                    }
+
+                    if(target_port > 0 && res.session){
+                        res.session->forward_to_backend(res.payload, res.payload_len, target_port);
+                    }
+                }
             }
         }
 
@@ -86,3 +194,4 @@ namespace pipeline {
 
 }
 }
+

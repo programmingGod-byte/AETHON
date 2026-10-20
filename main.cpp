@@ -1,4 +1,4 @@
-#include "_deps/fluxio-src/include/fluxio.h"
+#include <fluxio.h>
 #include <iostream>
 
 int main() {

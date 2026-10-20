@@ -8,6 +8,7 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <netinet/ip_icmp.h>
+#include <openssl/evp.h>
 #include <thread>
 #include <vector>
 #include <chrono>
@@ -374,7 +375,6 @@ void pin_xdp_map([[maybe_unused]] Engine& engine, struct bpf_map* map, const cha
     }
 }
 
-
 // ============================================================================
 // PARAMETER CONFIGURATION
 // ============================================================================
@@ -402,11 +402,11 @@ int main(int argc, char **argv) {
   // Discover and cache all local IPv4 addresses on this interface (AWS private IPs)
   aethon::Ipv4::load_interface_ips(ifname);
 
-  size_t rules_count = g_rule_db.load_from_file("rules/emerging-sql.rules");
-  if (rules_count == 0) {
-    rules_count = g_rule_db.load_from_file("../../rules/emerging-sql.rules");
+  size_t total_rules = g_rule_db.load_from_file("rules/test_rules.rules");
+  if (total_rules == 0) {
+    total_rules = g_rule_db.load_from_file("../../rules/test_rules.rules");
   }
-  std::cout << "Loaded " << rules_count << " Snort/Suricata rules.\n";
+  std::cout << "Loaded " << total_rules << " Snort/Suricata rules from test_rules.rules.\n";
   if (!g_rule_db.empty()) {
     g_master_scanner.set_alert_callback([](const aethon::scan::AttackAlert &alert) {
       std::cout << "\n[ALERT] Threat Detected! SID: " << alert.sid;
@@ -418,6 +418,29 @@ int main(int argc, char **argv) {
     g_master_scanner.compile_rules(g_rule_db);
     std::cout << "Compiled " << g_master_scanner.rule_count() << " rules into master Hyperscan database.\n";
   }
+
+
+  size_t total_domains = aethon::pipeline::g_domain_blocklist.load_from_file("rules/blocked_domains.txt");
+  if (total_domains == 0) {
+    total_domains = aethon::pipeline::g_domain_blocklist.load_from_file("../../rules/blocked_domains.txt");
+  }
+  std::cout << "Loaded " << total_domains << " blocked domains into TLS SNI blocklist.\n";
+
+
+
+  // setup the SSL and TLS
+  SSL_library_init();
+  OpenSSL_add_all_algorithms();
+  SSL_load_error_strings();
+
+  size_t total_services = aethon::pipeline::g_service_registry.load_from_file("rules/services.conf");
+  if(total_services == 0){
+    total_services = aethon::pipeline::g_service_registry.load_from_file("../../rules/services.conf");
+  }
+
+   std::cout << "Loaded " << total_services << " TLS services into Service Registry.\n";
+
+  
 
   std::cout << "Starting AF_XDP on interface: " << ifname << "\n";
   std::cout << "Using eBPF Program: " << prog_path << "\n";

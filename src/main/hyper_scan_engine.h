@@ -29,57 +29,78 @@ namespace aethon {
         };
 
         using AlertCallback = aethon::Function<void(const AttackAlert &)>;
+        using RuleMap = aethon::SingleThreadHashMap<uint32_t, const rules::AethonRule*, 0>;
+
+        struct MatchContext {
+            const RuleMap *rule_map{nullptr};
+            const AlertCallback *alert_cb{nullptr};
+            const uint8_t *payload{nullptr};
+            size_t payload_len{0};
+            size_t match_count{0};
+        };
+
+        static int on_match_event(unsigned int id, unsigned long long from,
+                                  unsigned long long to, unsigned int flags,
+                                  void *context) noexcept {
+            (void)from;
+            (void)flags;
+            auto *ctx = reinterpret_cast<MatchContext *>(context);
+            if (AETHON_UNLIKELY(!ctx)) {
+                return 0;
+            }
+
+            if (AETHON_LIKELY(ctx->rule_map)) {
+                const auto *found = ctx->rule_map->find(id);
+                if (AETHON_LIKELY(found != nullptr && *found != nullptr)) {
+                    const rules::AethonRule *rule = *found;
+
+                    if (!rule->contents.empty()) {
+                        const auto &first = rule->contents[0];
+                        size_t pat_len = first.pattern.size();
+
+                        if (first.offset >= 0) {
+                            size_t min_end = static_cast<size_t>(first.offset) + pat_len;
+                            if (to < min_end) {
+                                return 0;
+                            }
+                        }
+
+                        if (first.depth >= 0) {
+                            size_t start_base = (first.offset >= 0) ? static_cast<size_t>(first.offset) : 0;
+                            size_t max_end = start_base + static_cast<size_t>(first.depth);
+                            if (to > max_end) {
+                                return 0;
+                            }
+                        }
+                    }
+
+                    ctx->match_count++;
+                    if (ctx->alert_cb && *(ctx->alert_cb)) {
+                        AttackAlert alert;
+                        alert.sid = id;
+                        alert.match_offset = to;
+                        alert.payload = ctx->payload;
+                        alert.payload_len = ctx->payload_len;
+                        alert.rule = rule;
+                        (*(ctx->alert_cb))(alert);
+                    }
+                }
+            }
+            return 0;
+        }
 
         class HyperscanWorker;
 
         class alignas(implementation::hardware_destructive_interference_size) HyperscanEngine {
             public:
-                using RuleMap = aethon::SingleThreadHashMap<uint32_t, const rules::AethonRule*, 0>;
+                using RuleMap = scan::RuleMap;
 
             private:
-                hs_database_t * db_{nullptr}; // thread safe read only memory
-                hs_scratch_t * scratch_{nullptr}; // mutable working memory not thread safe
+                hs_database_t * db_{nullptr};
+                hs_scratch_t * scratch_{nullptr};
 
                 std::unique_ptr<RuleMap> rule_map_{nullptr};
                 AlertCallback alert_cb_{};
-
-                // internal match context passed to hyperscan c call bacl
-
-                struct MatchContext{
-                    HyperscanEngine *engine{nullptr};
-                    const uint8_t * payload{nullptr};
-
-                    size_t payload_len{0};
-
-                    size_t match_count{0};
-                };
-
-
-                // callback invoked bu hyper scan hardware scanner
-
-                static int on_match_event(unsigned int id, unsigned long long from,unsigned long long to, unsigned int flags,void *context) noexcept{
-                    auto *ctx = reinterpret_cast<MatchContext *>(context);
-                    if(AETHON_LIKELY(ctx && ctx->engine)){
-                        ctx->match_count++;
-                        if(ctx->engine->alert_cb_){
-                            AttackAlert alert;
-                            alert.sid  = id;
-                            alert.match_offset = to;
-                            alert.payload = ctx->payload;
-                            alert.payload_len = ctx->payload_len;
-
-                            if(AETHON_LIKELY(ctx->engine->rule_map_)){
-                                const rules::AethonRule **found  = ctx->engine->rule_map_->find(id);
-                                if(AETHON_LIKELY(found!=nullptr)){
-                                    alert.rule = *found;
-                                }
-                            }
-
-                            ctx->engine->alert_cb_(alert);
-                        }
-                    }
-                    return 0; // continue scaaning for additional matching patterns
-                }
 
                 static size_t next_power_of_two(size_t n) noexcept {
                     if (n < 64) return 64;
@@ -143,6 +164,9 @@ namespace aethon {
                         rule_map_->insert(r.sid, &r);
 
                         std::string pattern;
+
+                        
+
                         unsigned int flag = HS_FLAG_SINGLEMATCH | HS_FLAG_DOTALL;
 
                         if (!r.contents.empty()) {
@@ -155,6 +179,8 @@ namespace aethon {
                                 const auto &nxt = r.contents[c];
                                 int d = (nxt.distance >= 0) ? nxt.distance : 0;
                                 int w = (nxt.within >= 0)   ? nxt.within   : 100;
+                                if (d > 500) d = 500;
+                                if (w > 1000) w = 1000;
                                 if (w < d) w = d + 100;
                                 pattern += ".{" + std::to_string(d) + "," + std::to_string(w) + "}";
                                 pattern += nxt.pattern;
@@ -224,7 +250,8 @@ namespace aethon {
                     AETHON_BUILTIN_PREFETCH(payload, 0, 3);
 
                     MatchContext ctx;
-                    ctx.engine      = this;
+                    ctx.rule_map    = rule_map_.get();
+                    ctx.alert_cb    = &alert_cb_;
                     ctx.payload     = payload;
                     ctx.payload_len = payload_len;
                     ctx.match_count = 0;
@@ -259,43 +286,6 @@ namespace aethon {
             hs_scratch_t *scratch_{nullptr};
             const HyperscanEngine::RuleMap *rule_map_{nullptr};
             const AlertCallback *alert_cb_{nullptr};
-
-            struct MatchContext {
-                HyperscanWorker *worker{nullptr};
-                const uint8_t *payload{nullptr};
-                size_t payload_len{0};
-                size_t match_count{0};
-            };
-
-            // a static function does not have this pointer
-            // the hs_scan function
-            static int on_match_event(unsigned int id, unsigned long long from,
-                                      unsigned long long to, unsigned int flags,
-                                      void *context) noexcept {
-                (void)from;
-                (void)flags;
-                auto *ctx = reinterpret_cast<MatchContext *>(context);
-                if (AETHON_LIKELY(ctx && ctx->worker)) {
-                    ctx->match_count++;
-                    if (ctx->worker->alert_cb_ && *(ctx->worker->alert_cb_)) {
-                        AttackAlert alert;
-                        alert.sid          = id;
-                        alert.match_offset = to;
-                        alert.payload      = ctx->payload;
-                        alert.payload_len  = ctx->payload_len;
-
-                        if (AETHON_LIKELY(ctx->worker->rule_map_)) {
-                            const auto *found = ctx->worker->rule_map_->find(id);
-                            if (AETHON_LIKELY(found != nullptr)) {
-                                alert.rule = *found;
-                            }
-                        }
-
-                        (*(ctx->worker->alert_cb_))(alert);
-                    }
-                }
-                return 0;
-            }
 
         public:
             HyperscanWorker() = default;
@@ -349,7 +339,8 @@ namespace aethon {
                 AETHON_BUILTIN_PREFETCH(payload, 0, 3);
 
                 MatchContext ctx;
-                ctx.worker      = this;
+                ctx.rule_map    = rule_map_;
+                ctx.alert_cb    = alert_cb_;
                 ctx.payload     = payload;
                 ctx.payload_len = payload_len;
                 ctx.match_count = 0;

@@ -3,6 +3,7 @@ pkg_check_modules(LIBXDP REQUIRED libxdp)
 pkg_check_modules(LIBBPF REQUIRED libbpf)
 
 pkg_check_modules(LIBHS REQUIRED libhs)
+find_package(OpenSSL REQUIRED)
 
 # Determine host architecture include directory for BPF compilation
 if(EXISTS "/usr/include/${CMAKE_LIBRARY_ARCHITECTURE}")
@@ -22,6 +23,19 @@ add_custom_command(
 )
 add_custom_target(ebpf_prog ALL DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/main/xdp_kern_prog.o)
 
+add_executable(test_tls_engine ../tests/test_tls_engine.cpp)
+target_include_directories(test_tls_engine PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR} 
+    ${LIBHS_INCLUDE_DIRS}
+)
+target_link_libraries(test_tls_engine PRIVATE 
+    aethon::aethon 
+    OpenSSL::SSL 
+    OpenSSL::Crypto 
+    ${LIBHS_LIBRARIES}
+)
+target_compile_options(test_tls_engine PRIVATE -Wno-interference-size)
+
 add_executable(afxdp_control main/afxdp_control.cpp main/hs_engine.cpp)
 add_dependencies(afxdp_control ebpf_prog)
 target_include_directories(afxdp_control PRIVATE 
@@ -36,6 +50,8 @@ target_link_libraries(afxdp_control PRIVATE
     ${LIBXDP_LIBRARIES} 
     ${LIBBPF_LIBRARIES} 
     ${LIBHS_LIBRARIES}
+    OpenSSL::SSL
+    OpenSSL::Crypto
     pthread
 )
 target_compile_options(afxdp_control PRIVATE -Wall -Wextra -pthread -Wno-interference-size)

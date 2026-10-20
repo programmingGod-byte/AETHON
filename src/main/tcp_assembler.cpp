@@ -65,16 +65,22 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 #pragma once
 #include "aethon/aethon.h"
 #include "aethon/single_thread_hasmap.h"
+#include "tls_engine.h"
 #include <array>
 #include <cstddef>
 
 #include <cstdint>
 #include <cstring>
+#include <linux/in.h>
 #include <new>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <poll.h>
 namespace aethon {
     namespace IPv4TcpAssembler {
         enum class TcpState : uint8_t{
@@ -215,6 +221,7 @@ namespace aethon {
         static constexpr uint64_t AETHON_TCP_ESTAB_TIMEOUT_NS  = 30ULL * 1000000000ULL; 
 
 
+        struct TcpStreamSession;
         struct TcpAssemblyResult{
              bool is_ready{false};
             bool is_syn{false};
@@ -223,6 +230,7 @@ namespace aethon {
             uint16_t dst_port{0};
             const uint8_t *payload{nullptr};
             size_t payload_len{0};
+            TcpStreamSession *session{nullptr};
         };
 
         
@@ -240,10 +248,20 @@ namespace aethon {
             uint64_t *bitmap{nullptr};
             uint8_t  *ring_buf{nullptr}; // 64 kb preallocated 
 
+            tls::TlsConnection tls_conn;
+
+            int backend_fd {-1};
+            uint16_t backend_port {0};
 
             TcpStreamSession() = default;
 
             ~TcpStreamSession() {
+
+                if(backend_fd >=0){
+                    ::close(backend_fd);
+                    backend_fd = -1;
+                }
+
                 if (ring_buf) {
                     std::free(ring_buf);
                     ring_buf = nullptr;
@@ -275,6 +293,59 @@ namespace aethon {
                 }
                 std::memset(bitmap, 0, AETHON_TCP_BITMAP_WORDS * sizeof(uint64_t));
                 return true;
+            }
+
+            AETHON_ALWAYS_INLINE bool forward_to_backend(const uint8_t *data, size_t len, uint16_t target_port) noexcept {
+                if(AETHON_UNLIKELY(!data || len == 0 || target_port ==0)){
+                    return false;
+                }
+
+                if(AETHON_UNLIKELY(backend_fd < 0 || backend_port != target_port)){
+                    if(backend_fd >=0){
+                        ::close(backend_fd);
+                        backend_fd = -1;
+                    }
+
+                    backend_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+                    if(backend_fd < 0){
+                        return false;
+                    }
+
+                    int one  =1;
+
+                    setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+                    struct sockaddr_in sin{};
+                    sin.sin_family = AF_INET;
+                    sin.sin_port = htons(target_port);
+                    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                    connect(backend_fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin));
+
+                    backend_port = target_port;
+
+                }
+
+                ssize_t sent = send(backend_fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                return sent > 0;
+
+            }
+
+
+            AETHON_ALWAYS_INLINE ssize_t read_from_backend(uint8_t * buf, size_t max_len, int timeout_ms = 50) noexcept {
+                if(AETHON_UNLIKELY(backend_fd < 0 || !buf || max_len == 0)){
+                    return 0;
+                }
+
+                struct pollfd pfd;
+                pfd.fd = backend_fd;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                int ret = ::poll(&pfd, 1, timeout_ms);
+                if (ret > 0 && (pfd.revents & POLLIN)) {
+                    ssize_t n = ::recv(backend_fd, buf, max_len, MSG_DONTWAIT);
+                    return (n > 0) ? n : 0;
+                }
+                return 0;
             }
 
             
@@ -494,6 +565,7 @@ namespace aethon {
                 if(AETHON_LIKELY(slot != nullptr)){
                     session = *slot;
                     AETHON_BUILTIN_PREFETCH(session, 1, 3);
+                    result.session = session;
                 }else{
                     // if NON SYN Packet DROP
                     if(AETHON_UNLIKELY(!(flags & TH_SYN))){
@@ -524,6 +596,7 @@ namespace aethon {
                     parse_tcp_syn_option(tcph, session->params);
 
                      sessions_.insert(key, session);
+                    result.session = session;
                     result.is_syn = true;
                     return result;
                 }
