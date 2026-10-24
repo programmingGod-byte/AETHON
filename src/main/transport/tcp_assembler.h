@@ -273,6 +273,8 @@ namespace aethon {
             uint8_t server_mac[6]{0};
             uint32_t send_nxt{0};
 
+            std::vector<uint8_t> client_hello_buf;
+
             TcpStreamSession() = default;
 
             ~TcpStreamSession() {

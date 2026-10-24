@@ -157,7 +157,33 @@ namespace pipeline {
 
 
         if (AETHON_LIKELY(res.is_ready && res.payload_len > 0)) {
-            auto tls_info = tls::parse_client_hello(res.payload, res.payload_len);
+            const uint8_t * hello_data = res.payload;
+            size_t hello_len = res.payload_len;
+
+            // Handle multi-segment ClientHello (e.g., Chrome with post-quantum keys > 1460 bytes MTU)
+            if(res.session && res.session->tls_conn.status() == tls::TlsSessionStatus::IDLE){
+                // Check if an accumulation is already in progress or if this packet starts a TLS ClientHello
+                if (!res.session->client_hello_buf.empty() || 
+                    (res.payload_len >= 6 && res.payload[0] == 0x16 && res.payload[5] == 0x01)) {
+                    res.session->client_hello_buf.insert(
+                        res.session->client_hello_buf.end(), res.payload, res.payload + res.payload_len);
+                    hello_data = res.session->client_hello_buf.data();
+                    hello_len = res.session->client_hello_buf.size();
+
+                    // Read 5-byte TLS record header (length at bytes 3-4) to verify full record arrival
+                    if (hello_len >= 5) {
+                        uint16_t rec_len = (static_cast<uint16_t>(hello_data[3]) << 8) | hello_data[4];
+                        // If record is incomplete, ACK this segment immediately and wait for the rest
+                        if (hello_len < 5 + static_cast<size_t>(rec_len)) {
+                            return net::PacketInjector::ipv4_send_tcp_ack(
+                                sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt);
+                        }
+                    }
+                }
+            }
+
+            // Parse complete ClientHello to extract SNI and enforce domain policy
+            auto tls_info = tls::parse_client_hello(hello_data, hello_len);
 
             if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(tls_info.is_client_hello, 1, 0.02)) {
                 if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
@@ -192,7 +218,9 @@ namespace pipeline {
             }
 
             if (res.session && res.session->tls_conn.status() != tls::TlsSessionStatus::IDLE) {
-                res.session->tls_conn.feed_network_data(res.payload, res.payload_len);
+                // Feed the fully assembled ClientHello into OpenSSL and reclaim memory
+                res.session->tls_conn.feed_network_data(hello_data, hello_len);
+                res.session->client_hello_buf.clear();
 
                                 if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
                     res.session->tls_conn.step_handshake();
