@@ -265,7 +265,18 @@ namespace aethon {
 
             int backend_fd {-1};
             uint16_t backend_port {0};
+            static constexpr size_t MAX_BACKEND_BUF = 256 * 1024;
             std::vector<uint8_t> backend_tx_buf;
+            bool epollout_armed{false};
+
+
+            // Compute dynamic receive window based on remaining buffer capacity
+            AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
+                size_t used = backend_tx_buf.size();
+                if (used >= MAX_BACKEND_BUF) return 0;
+                size_t remaining = MAX_BACKEND_BUF - used;
+                return static_cast<uint16_t>(std::min<size_t>(65535, remaining));
+            }
 
             hs_stream_t *hs_stream{nullptr};
 
@@ -362,12 +373,20 @@ namespace aethon {
 
                     connect(backend_fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin));
                     backend_port = target_port;
+                    // Bound the pending write buffer to protect against OOM
+                    if (backend_tx_buf.size() + len > MAX_BACKEND_BUF) {
+                        return false;
+                    }
                     backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
                     return true;
                 }
 
                 if(!backend_tx_buf.empty()){
-                     backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
+                    // Check capacity before buffering in case backend is slow
+                    if (backend_tx_buf.size() + len > MAX_BACKEND_BUF) {
+                        return false;
+                    }
+                    backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
                     flush_backend_tx();
                     return true;
                 }
@@ -375,6 +394,9 @@ namespace aethon {
                 ssize_t sent = ::send(backend_fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
                 if(sent < 0){
                     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+                        if (backend_tx_buf.size() + len > MAX_BACKEND_BUF) {
+                            return false;
+                        }
                         backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
                         return true;
                     }
@@ -382,11 +404,13 @@ namespace aethon {
                 }
 
                 if(static_cast<size_t>(sent) < len){
-                     backend_tx_buf.insert(backend_tx_buf.end(), data + sent, data + len);
+                    size_t unsent = len - sent;
+                    if (backend_tx_buf.size() + unsent > MAX_BACKEND_BUF) {
+                        return false;
+                    }
+                    backend_tx_buf.insert(backend_tx_buf.end(), data + sent, data + len);
                 }
                 return true;
-                
-
             }
 
 

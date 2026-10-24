@@ -104,7 +104,8 @@ public:
         uint32_t server_seq,
         uint32_t client_ack,
         const uint8_t * __restrict__ tls_data,
-        size_t tls_len
+        size_t tls_len,
+        uint16_t window = 65535
     ) noexcept {
         const size_t total_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr) + tls_len;
         AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
@@ -137,7 +138,8 @@ public:
         out_tcph->doff = 5;
         out_tcph->ack = 1;
         out_tcph->psh = (tls_len > 0) ? 1 : 0;
-        out_tcph->window = htons(65535);
+        // Advertise the true flow control receive window
+        out_tcph->window = htons(window);
 
         uint8_t *payload_dst = pkt + sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr);
         if (AETHON_LIKELY(tls_len > 0)) {
@@ -172,7 +174,8 @@ public:
         uint32_t server_seq,
         uint32_t client_ack,
         const uint8_t * __restrict__ tls_data,
-        size_t tls_len
+        size_t tls_len,
+        uint16_t window = 65535
     ) noexcept {
         return ipv4_send_tcp_data(
             sock, buf_addr, pkt,
@@ -180,7 +183,7 @@ public:
             reinterpret_cast<const uint8_t *>(eth->ether_dhost),
             iph->saddr, iph->daddr,
             tcph->source, tcph->dest,
-            server_seq, client_ack, tls_data, tls_len);
+            server_seq, client_ack, tls_data, tls_len, window);
     }
 
 
@@ -193,7 +196,8 @@ public:
         const struct iphdr * __restrict__ iph,
         const struct tcphdr * __restrict__ tcph,
         uint32_t server_seq,
-        uint32_t client_ack
+        uint32_t client_ack,
+        uint16_t window = 65535
     ) noexcept {
         constexpr size_t total_ack_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr);
         AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
@@ -235,7 +239,8 @@ public:
         out_tcph->ack_seq = htonl(client_ack);
         out_tcph->ack = 1;
         out_tcph->doff = 5;
-        out_tcph->window = htons(65535);
+        // Flow control: advertise actual remaining receive window buffer space
+        out_tcph->window = htons(window);
         out_tcph->check = 0;
         out_tcph->check = htons(ipv4_tcp_compute_checksum(out_iph->saddr, out_iph->daddr, out_tcph, sizeof(struct tcphdr)));
 
@@ -423,7 +428,8 @@ public:
         uint16_t client_port,
         uint16_t server_port,
         uint32_t server_seq,
-        uint32_t client_ack
+        uint32_t client_ack,
+        uint16_t window = 65535
     ) noexcept {
         constexpr size_t total_fin_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr);
         AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
@@ -456,7 +462,7 @@ public:
         out_tcph->ack = 1;
         out_tcph->fin = 1;
         out_tcph->doff = 5;
-        out_tcph->window = htons(65535);
+        out_tcph->window = htons(window);
         out_tcph->check = 0;
         out_tcph->check = htons(ipv4_tcp_compute_checksum(out_iph->saddr, out_iph->daddr, out_tcph, sizeof(struct tcphdr)));
 
