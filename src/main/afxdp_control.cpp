@@ -1,4 +1,4 @@
-#include "../af_xdp_header.h"
+#include "af_xdp_header.h"
 #include "aethon/aethon.h"
 #include <cstddef>
 #include <cstdint>
@@ -17,8 +17,8 @@
 #include <sched.h>
 #include <pthread.h>
 #include <poll.h>
-#include "udp_assembler.cpp"
-#include "ip_address.cpp"
+#include "udp_assembler.h"
+#include "ip_address.h"
 #include "tcp_pipeline.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -397,7 +397,7 @@ int main(int argc, char **argv) {
   std::signal(SIGTERM, sig_handler);
 
   const char *ifname = (argc > 1) ? argv[1] : "veth0";
-  const char *prog_path = (argc > 2) ? argv[2] : "src/main/xdp_kern_prog.o";
+  const char *prog_path = (argc > 2) ? argv[2] : "src/main/ebpf/xdp_kern_prog.o";
 
   // Discover and cache all local IPv4 addresses on this interface (AWS private IPs)
   aethon::Ipv4::load_interface_ips(ifname);

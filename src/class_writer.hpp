@@ -21,7 +21,7 @@ namespace flux {
     namespace implementation = ::implementation;
 }
 #endif
-#include "../_deps/fluxio-src/include/fluxio.h"
+#include <fluxio.h>
 #define MAX_FILE_NAME_SIZE 100
 
 class BatchWriter {

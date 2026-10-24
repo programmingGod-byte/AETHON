@@ -193,7 +193,7 @@ public:
   }
 
   bool setup(const char *ifname,
-             const char *prog_name = "src/main/xdp_kern_prog.o",
+             const char *prog_name = "src/main/ebpf/xdp_kern_prog.o",
              const char *prog_section_name = "aethon_xdp_prog_main",
              enum xdp_attach_mode xdp_running_mode = XDP_MODE_SKB,
              const char *xdp_xsk_map_name = "aethon_xsks_map",
@@ -228,11 +228,13 @@ public:
     std::string resolved_prog = prog_name ? prog_name : "";
     if (resolved_prog.empty() || access(resolved_prog.c_str(), F_OK) != 0) {
       const char *fallbacks[] = {
+          "src/main/ebpf/xdp_kern_prog.o",
+          "../../src/main/ebpf/xdp_kern_prog.o",
+          "../src/main/ebpf/xdp_kern_prog.o",
           "src/main/xdp_kern_prog.o",
           "../../src/main/xdp_kern_prog.o",
           "../src/main/xdp_kern_prog.o",
-          "./xdp_kern_prog.o",
-          "/home/shivam/Desktop/learning/advanceCpp/Aethon/src/main/xdp_kern_prog.o"
+          "./xdp_kern_prog.o"
       };
       for (const char *fb : fallbacks) {
         if (access(fb, F_OK) == 0) {

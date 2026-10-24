@@ -1,5 +1,5 @@
 #pragma once
-#include "../../aethon/aethon.h"
+#include "aethon/aethon.h"
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -101,7 +101,7 @@ public:
         std::string_view lower_domain(buffer, domain.size());
 
         if (blocked_domains_.find(lower_domain) != blocked_domains_.end()) {
-            return true;
+            return false;
         }
 
         size_t dot_pos = lower_domain.find('.');

@@ -6,6 +6,8 @@ PRODUCTION_ARCHITECTURE.md*.gch
 *.gch
 
 .idea/
+cmake-build-debug/
+compile_commands.json
 __pycache__/
 *.bin
 captured_rst.*

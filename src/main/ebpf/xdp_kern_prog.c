@@ -6,7 +6,7 @@
 #include <linux/ipv6.h>
 #include <linux/in.h>
 #include <bpf/bpf_endian.h>
-#include "../common.h"
+#include "common.h"
 
 #define AETHON_MAX_IPS 65536
 #define AETHON_MAX_QUEUE_SIZE 64

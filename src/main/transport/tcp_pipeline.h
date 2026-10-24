@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../aethon/aethon.h"
-#include "tcp_assembler.cpp"
+#include "aethon/aethon.h"
+#include "tcp_assembler.h"
 #include "hyper_scan_engine.h"
 #include "packet_injector.h"
 #include <cstddef>

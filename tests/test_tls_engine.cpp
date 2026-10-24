@@ -6,8 +6,8 @@
 #include <hs/hs.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include "../src/main/tls_engine.h"
-#include "../src/main/service_registry.h"
+#include "tls/tls_engine.h"
+#include "tls/service_registry.h"
 
 static SSL_CTX* create_client_ctx() {
     const SSL_METHOD* method = TLS_client_method();

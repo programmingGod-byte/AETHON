@@ -6,7 +6,7 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/types.h>
-#include "../../aethon/aethon.h"
+#include "aethon/aethon.h"
 
 namespace aethon::tls {
     enum class TlsSessionStatus : uint8_t {

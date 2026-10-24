@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../aethon/aethon.h"
-#include "../af_xdp_header.h"
+#include "aethon/aethon.h"
+#include "af_xdp_header.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstring>

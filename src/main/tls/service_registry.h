@@ -26,7 +26,7 @@ This single line ensures your server only communicates using modern, unbreakable
 */
 #pragma once
 
-#include "../../aethon/aethon.h"
+#include "aethon/aethon.h"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <array>
@@ -42,7 +42,7 @@ This single line ensures your server only communicates using modern, unbreakable
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include "../../aethon/single_thread_hasmap.h"
+#include "aethon/single_thread_hasmap.h"
 
 
 

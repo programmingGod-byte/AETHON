@@ -181,7 +181,7 @@ These keywords ONLY apply if there was a previous content keyword before them!
 */
 
 #pragma once
-#include "../../aethon/aethon.h"
+#include "aethon/aethon.h"
 #include <cstddef>
 #include <hs/hs.h>
 #include <cstdint>

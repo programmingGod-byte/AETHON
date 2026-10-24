@@ -80,7 +80,7 @@ string)
 */
 
 #pragma once
-#include "../../aethon/aethon.h"
+#include "aethon/aethon.h"
 #include <arpa/inet.h>
 #include <cstddef>
 #include <cstdint>

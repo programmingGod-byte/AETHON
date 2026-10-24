@@ -1,5 +1,5 @@
 #pragma once
-#include "../../aethon/aethon.h"
+#include "aethon/aethon.h"
 #include "hs_common.h"
 #include "hs_compile.h"
 #include "hs_runtime.h"
@@ -13,8 +13,8 @@
 #include <unordered_map>
 #include <iostream>
 #include <functional>
-#include "../../aethon/function.h"
-#include "../../aethon/single_thread_hasmap.h"
+#include "aethon/function.h"
+#include "aethon/single_thread_hasmap.h"
 
 namespace aethon {
     namespace scan {
