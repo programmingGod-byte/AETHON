@@ -48,6 +48,55 @@ namespace pipeline {
     inline dns::DomainBlocklist g_domain_blocklist;
     inline service::ServiceRegistry g_service_registry;
 
+    AETHON_ALWAYS_INLINE bool send_tcp_segmented_data(
+        xdp::aethon_xsk_socket_info * __restrict__ sock,
+        IPv4TcpAssembler::TcpStreamSession * __restrict__ session,
+        const uint8_t * __restrict__ data,
+        size_t len,
+        std::vector<uint64_t> &tx_pool
+    ) noexcept {
+        if (AETHON_UNLIKELY(!sock || !session || !data || len == 0)) {
+            return false;
+        }
+
+        constexpr size_t AETHON_MSS = 1460;
+        size_t offset = 0;
+        bool all_sent = true;
+
+        while (offset < len) {
+            if (AETHON_UNLIKELY(tx_pool.empty())) {
+                all_sent = false;
+                break;
+            }
+
+            size_t chunk_len = std::min(len - offset, AETHON_MSS);
+            uint64_t tx_buf_addr = tx_pool.back();
+            tx_pool.pop_back();
+
+            uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
+            AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
+
+            bool sent = net::PacketInjector::ipv4_send_tcp_data(
+                sock, tx_buf_addr, pkt,
+                session->client_mac, session->server_mac,
+                session->key.src_ip, session->key.dst_ip,
+                session->key.src_port, session->key.dst_port,
+                session->send_nxt, session->rcv_nxt,
+                data + offset, chunk_len);
+
+            if (AETHON_LIKELY(sent)) {
+                session->send_nxt += chunk_len;
+                offset += chunk_len;
+            } else {
+                tx_pool.push_back(tx_buf_addr);
+                all_sent = false;
+                break;
+            }
+        }
+
+        return all_sent;
+    }
+
     template <typename Scanner>
     AETHON_ALWAYS_INLINE bool handle_tcp_packet(
         xdp::aethon_xsk_socket_info * __restrict__ sock,
@@ -140,16 +189,13 @@ namespace pipeline {
             if (res.session && res.session->tls_conn.status() != tls::TlsSessionStatus::IDLE) {
                 res.session->tls_conn.feed_network_data(res.payload, res.payload_len);
 
-                if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
+                                if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
                     res.session->tls_conn.step_handshake();
                     uint8_t tx_buf[16384];
                     int tx_len = res.session->tls_conn.read_pending_tx(tx_buf, sizeof(tx_buf));
                     if (tx_len > 0) {
-                        net::PacketInjector::ipv4_send_tcp_data(
-                            sock, buf_addr, pkt, eth, iph, tcph,
-                            res.session->rcv_nxt, ntohl(tcph->seq) + payload_len,
-                            tx_buf, tx_len);
-                        return true;
+                        send_tcp_segmented_data(sock, res.session, tx_buf, static_cast<size_t>(tx_len), tx_pool);
+                        return false;
                     }
                 }
 
@@ -185,8 +231,8 @@ namespace pipeline {
                                 res.session->forward_to_backend(plain_buf, plain_len, target_port);
                                 if(AETHON_LIKELY(epfd >=0 && res.session->backend_fd >=0)){
                                     struct epoll_event ev{};
+                                    ev.events = EPOLLIN | EPOLLRDHUP;
                                     ev.data.ptr = res.session;
-                                    // add a new socket to watch
                                     epoll_ctl(epfd, EPOLL_CTL_ADD, res.session->backend_fd, &ev);
                                 }
                             }
@@ -202,17 +248,7 @@ namespace pipeline {
                         uint8_t enc_tx[16384];
                         int enc_len = res.session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
                         if (AETHON_LIKELY(enc_len > 0)) {
-                            uint64_t tx_buf_addr = buf_addr;
-                            uint8_t *tx_pkt = pkt;
-                            if (AETHON_LIKELY(!tx_pool.empty())) {
-                                tx_buf_addr = tx_pool.back();
-                                tx_pool.pop_back();
-                                tx_pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
-                                AETHON_BUILTIN_PREFETCH(tx_pkt, 1, 3);
-                            }
-                            return net::PacketInjector::ipv4_send_tcp_data(
-                                sock, tx_buf_addr, tx_pkt, eth, iph, tcph, 
-                                res.session->rcv_nxt, ntohl(tcph->seq) + payload_len, enc_tx, enc_len);
+                            send_tcp_segmented_data(sock, res.session, enc_tx, static_cast<size_t>(enc_len), tx_pool);
                         }
                     }
                 }
@@ -256,47 +292,6 @@ namespace pipeline {
         return false;
     }
 
-
-
-
-
-
-    AETHON_ALWAYS_INLINE bool send_backend_response_packet(
-        xdp::aethon_xsk_socket_info * __restrict__ sock,
-        IPv4TcpAssembler::TcpStreamSession * __restrict__ session,
-        const uint8_t * __restrict__ data,
-        size_t len,
-        std::vector<uint64_t> &tx_pool
-    ) noexcept {
-        if (AETHON_UNLIKELY(!sock || !session || !data || len == 0 || tx_pool.empty())) {
-            return false;
-        }
-
-        uint64_t tx_buf_addr = tx_pool.back();
-        tx_pool.pop_back();
-
-        uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
-        AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
-
-        bool sent = net::PacketInjector::ipv4_send_tcp_data(
-            sock, tx_buf_addr, pkt,
-            session->client_mac, session->server_mac,
-            session->key.dst_ip, session->key.src_ip,
-            htons(session->key.dst_port), htons(session->key.src_port),
-            session->send_nxt, session->rcv_nxt,
-            data, len);
-
-        if (AETHON_LIKELY(sent)) {
-            session->send_nxt += len;
-        } else {
-            tx_pool.push_back(tx_buf_addr);
-        }
-        return sent;
-    }
-
-
-
-
     AETHON_ALWAYS_INLINE uint32_t drain_backend_events(
         int epfd,
         xdp::aethon_xsk_socket_info * __restrict__ sock,
@@ -311,7 +306,6 @@ namespace pipeline {
 
         uint32_t work_done = 0;
         for (int i = 0; i < nfds; ++i) {
-            // Retrieve the active TCP session associated with this backend socket
             auto *session = reinterpret_cast<IPv4TcpAssembler::TcpStreamSession *>(events[i].data.ptr);
             if (AETHON_UNLIKELY(!session || session->backend_fd < 0)) continue;
 
@@ -322,7 +316,7 @@ namespace pipeline {
                 uint8_t enc_tx[16384];
                 int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
                 if (AETHON_LIKELY(enc_len > 0)) {
-                    if (send_backend_response_packet(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+                    if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
                         work_done++;
                     }
                 }

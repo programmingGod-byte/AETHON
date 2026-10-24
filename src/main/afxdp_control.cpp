@@ -87,7 +87,7 @@ static inline void free_completion_ring(aethon_xsk_socket_info *sock, std::vecto
 
 
   for(unsigned int i = 0; i< completed;i++){
-    uint64_t addr = *xsk_ring_cons__comp_addr(&sock->umen->cq, idx +1);
+    uint64_t addr = *xsk_ring_cons__comp_addr(&sock->umen->cq, idx +i);
     if(addr >= tx_boundary){
       // it came from the tx poll
       tx_pool.push_back(addr);
@@ -237,6 +237,13 @@ void rx_worker(Engine &engine, int queue_id) {
             goto recycle_slot;
           }
 
+          const size_t ip_hdr_len = iph->ihl * 4;
+          const size_t ip_total_len = ntohs(iph->tot_len);
+          if(AETHON_UNLIKELY(ip_hdr_len < sizeof(struct iphdr) || ip_total_len < ip_hdr_len ||
+                              ip_total_len > desc->len - sizeof(struct ether_header) )){
+                                 goto recycle_slot;
+                              }
+
           // Host IP filter: Accept traffic for our interface private IPs, broadcast, or multicast
           const uint32_t dst_ip = iph->daddr;
           const bool is_for_this_host = (Ipv4::g_host_ips.count == 0) ||
@@ -341,6 +348,9 @@ void rx_worker(Engine &engine, int queue_id) {
               tx_desc->len=desc->len;
 
               xsk_ring_prod__submit(&sock->tx,1);
+              if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->tx))) {
+                sendto(sock_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+              }
               continue;
             }else goto recycle_slot;
           }
