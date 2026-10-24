@@ -173,7 +173,7 @@ void rx_worker(Engine &engine, int queue_id) {
     unsigned int rcvd = xsk_ring_cons__peek(&sock->rx, Config::BATCH_SIZE, &idx_rx);
         free_completion_ring<Config>(sock, tx_pool);
 
-    uint32_t backend_work = pipeline::drain_backend_events(epfd, sock, tx_pool);
+    uint32_t backend_work = pipeline::drain_backend_events(epfd, sock, tx_pool,tcp_assembler);
     if(AETHON_UNLIKELY(backend_work > 0)){
       idle_iters = 0;
     }

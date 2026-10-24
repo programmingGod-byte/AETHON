@@ -64,6 +64,7 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 */
 #pragma once
 #include <hs/hs.h>
+#include <vector>
 #include "aethon/aethon.h"
 
 #ifndef AETHON_ALWAYS_INLINE
@@ -236,6 +237,7 @@ namespace aethon {
              bool is_ready{false};
             bool is_syn{false};
             bool is_closed{false};
+            bool need_ack{false};
             uint16_t src_port{0};
             uint16_t dst_port{0};
             const uint8_t *payload{nullptr};
@@ -263,6 +265,8 @@ namespace aethon {
 
             int backend_fd {-1};
             uint16_t backend_port {0};
+            std::vector<uint8_t> backend_tx_buf;
+
             hs_stream_t *hs_stream{nullptr};
 
             uint8_t client_mac[6]{0};
@@ -294,6 +298,19 @@ namespace aethon {
             }
             TcpStreamSession(const TcpStreamSession &) = delete;
             TcpStreamSession &operator=(const TcpStreamSession &) = delete;
+
+
+            AETHON_ALWAYS_INLINE bool flush_backend_tx() noexcept {
+                if(backend_fd < 0 || backend_tx_buf.empty()) return true;
+                ssize_t sent = ::send(backend_fd, backend_tx_buf.data(), backend_tx_buf.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (sent > 0) {
+                    backend_tx_buf.erase(backend_tx_buf.begin(), backend_tx_buf.begin() + sent);
+                }
+                return backend_tx_buf.empty();
+            }
+
+
+
 
             AETHON_ALWAYS_INLINE bool init_bufferes() noexcept {
                 if(AETHON_LIKELY(ring_buf != nullptr)){
@@ -327,37 +344,56 @@ namespace aethon {
                         backend_fd = -1;
                     }
 
+                    backend_tx_buf.clear();
+
                     backend_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
                     if(backend_fd < 0){
                         return false;
                     }
 
-                    int one  =1;
-
+                    int one = 1;
                     setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-                    struct sockaddr_in sin{};
-                    sin.sin_family = AF_INET;
+                    struct sockaddr_in sin {};
+                    sin.sin_family  = AF_INET;
                     sin.sin_port = htons(target_port);
                     sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
                     connect(backend_fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin));
-
                     backend_port = target_port;
-
+                    backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
+                    return true;
                 }
 
-                ssize_t sent = send(backend_fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
-                return sent > 0;
+                if(!backend_tx_buf.empty()){
+                     backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
+                    flush_backend_tx();
+                    return true;
+                }
+
+                ssize_t sent = ::send(backend_fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if(sent < 0){
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+                        backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
+                        return true;
+                    }
+                    return false;
+                }
+
+                if(static_cast<size_t>(sent) < len){
+                     backend_tx_buf.insert(backend_tx_buf.end(), data + sent, data + len);
+                }
+                return true;
+                
 
             }
 
 
             AETHON_ALWAYS_INLINE ssize_t read_from_backend(uint8_t * buf, size_t max_len, int timeout_ms = 50) noexcept {
                  if(AETHON_UNLIKELY(backend_fd < 0 || !buf || max_len == 0)){
-                    return 0;
+                    return -1;
                 }
-                ssize_t n = ::recv(backend_fd, buf, max_len, MSG_DONTWAIT);
-                return (n > 0) ? n : 0;
+                return  ::recv(backend_fd, buf, max_len, MSG_DONTWAIT);
+                
             }
 
             
@@ -684,7 +720,8 @@ namespace aethon {
                     // packet completelybehinf rcv_nxt
 
                     if(AETHON_UNLIKELY(TcpSeq::lte(cur_seq+cur_len,session->rcv_nxt))){
-                        return result; // drop 
+                        result.need_ack = true;
+                        return result; 
                     }
 
                     // partial overlap Packet starts before rcv_nxt , but end after rcv_nxt

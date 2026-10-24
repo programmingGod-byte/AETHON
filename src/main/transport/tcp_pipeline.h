@@ -148,7 +148,12 @@ namespace pipeline {
             return net::PacketInjector::ipv4_send_tcp_syn_ack(
                 sock, buf_addr, pkt, eth, iph, tcph, initial_server_isn, ntohl(tcph->seq));
         }
-    
+        
+
+        if(AETHON_UNLIKELY(res.need_ack && res.session)){
+            return net::PacketInjector::ipv4_send_tcp_ack(
+        sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt);
+        }
 
 
         if (AETHON_LIKELY(res.is_ready && res.payload_len > 0)) {
@@ -231,10 +236,13 @@ namespace pipeline {
                                 res.session->forward_to_backend(plain_buf, plain_len, target_port);
                                 if(AETHON_LIKELY(epfd >=0 && res.session->backend_fd >=0)){
                                     struct epoll_event ev{};
-                                    ev.events = EPOLLIN | EPOLLRDHUP;
+                                    ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
                                     ev.data.ptr = res.session;
                                     epoll_ctl(epfd, EPOLL_CTL_ADD, res.session->backend_fd, &ev);
                                 }
+
+                                return net::PacketInjector::ipv4_send_tcp_ack(
+    sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt);
                             }
                         }
                     }
@@ -284,10 +292,13 @@ namespace pipeline {
 
                         if(AETHON_LIKELY(epfd >=0 && res.session->backend_fd >=0 && prev_fd != res.session->backend_fd)){
                             struct epoll_event ev{};
-                            ev.events = EPOLLIN | EPOLLRDHUP;
+                            ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
                             ev.data.ptr = res.session;
                             epoll_ctl(epfd, EPOLL_CTL_ADD, res.session->backend_fd, &ev);
                         }
+                        
+                         return net::PacketInjector::ipv4_send_tcp_ack(
+        sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt);
                     }
                 }
             }
@@ -300,10 +311,12 @@ namespace pipeline {
         return false;
     }
 
-    AETHON_ALWAYS_INLINE uint32_t drain_backend_events(
+    
+        AETHON_ALWAYS_INLINE uint32_t drain_backend_events(
         int epfd,
         xdp::aethon_xsk_socket_info * __restrict__ sock,
-        std::vector<uint64_t> &tx_pool
+        std::vector<uint64_t> &tx_pool,
+        IPv4TcpAssembler::TcpAssemblerEngine &tcp_engine
     ) noexcept {
         if (AETHON_UNLIKELY(epfd < 0)) return 0;
 
@@ -317,25 +330,67 @@ namespace pipeline {
             auto *session = reinterpret_cast<IPv4TcpAssembler::TcpStreamSession *>(events[i].data.ptr);
             if (AETHON_UNLIKELY(!session || session->backend_fd < 0)) continue;
 
-            uint8_t resp_buf[16384];
-            ssize_t n = session->read_from_backend(resp_buf, sizeof(resp_buf));
-            if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(n > 0, 1, 0.90)) {
-                if (session->tls_conn.is_established()) {
-                    session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
-                    uint8_t enc_tx[16384];
-                    int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
-                    if (AETHON_LIKELY(enc_len > 0)) {
-                        if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+            if (events[i].events & EPOLLOUT) {
+                session->flush_backend_tx();
+                if (session->backend_tx_buf.empty()) {
+                    struct epoll_event ev{};
+                    ev.events = EPOLLIN | EPOLLRDHUP;
+                    ev.data.ptr = session;
+                    epoll_ctl(epfd, EPOLL_CTL_MOD, session->backend_fd, &ev);
+                }
+            }
+
+            bool backend_closed = (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+
+            if (events[i].events & EPOLLIN) {
+                uint8_t resp_buf[16384];
+                ssize_t n = session->read_from_backend(resp_buf, sizeof(resp_buf));
+                if (n > 0) {
+                    if (session->tls_conn.is_established()) {
+                        session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
+                        uint8_t enc_tx[16384];
+                        int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
+                        if (AETHON_LIKELY(enc_len > 0)) {
+                            if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+                                work_done++;
+                            }
+                        }
+                    } else {
+                        if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
                             work_done++;
                         }
                     }
-                } else {
-                    if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
-                        work_done++;
-                    }
+                } else if (n == 0) {
+                    backend_closed = true;
                 }
             }
+
+            if (AETHON_UNLIKELY(backend_closed)) {
+                epoll_ctl(epfd, EPOLL_CTL_DEL, session->backend_fd, nullptr);
+                ::close(session->backend_fd);
+                session->backend_fd = -1;
+
+                if (!tx_pool.empty()) {
+                    uint64_t tx_buf_addr = tx_pool.back();
+                    tx_pool.pop_back();
+                    uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
+                    bool sent = net::PacketInjector::ipv4_send_tcp_fin(
+                        sock, tx_buf_addr, pkt,
+                        session->client_mac, session->server_mac,
+                        session->key.src_ip, session->key.dst_ip,
+                        session->key.src_port, session->key.dst_port,
+                        session->send_nxt, session->rcv_nxt);
+                    if (sent) {
+                        session->send_nxt++;
+                    } else {
+                        tx_pool.push_back(tx_buf_addr);
+                    }
+                }
+
+                tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
+            }
         }
+        
         return work_done;
     }
 
