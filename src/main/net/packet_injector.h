@@ -156,7 +156,9 @@ public:
         tx_desc->addr = buf_addr;
         tx_desc->len = total_len;
         xsk_ring_prod__submit(&sock->tx, 1);
-        sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->tx))) {
+            sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        }
         return true;
     }
 
@@ -260,8 +262,9 @@ public:
         tx_desc->len = total_rst_len;
 
         xsk_ring_prod__submit(&sock->tx, 1);
-
-        sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->tx))) {
+            sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        }
         return true;
     }
 
@@ -333,7 +336,9 @@ public:
         tx_desc->addr = buf_addr;
         tx_desc->len = total_synack_len;
         xsk_ring_prod__submit(&sock->tx, 1);
-        sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->tx))) {
+            sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+        }
         return true;
     }
 
