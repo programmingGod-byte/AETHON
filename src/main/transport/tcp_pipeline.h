@@ -77,7 +77,19 @@ namespace pipeline {
             if(AETHON_UNLIKELY(tx_pool.empty())){
                 break;
             }
-            size_t chunk_len = std::min(session->snd_buf.size() - sent_offset, AETHON_MSS);
+
+            // client flow control
+            size_t in_flight = session->send_nxt - session->snd_una;
+            if(in_flight >= session->snd_wnd){
+                break;
+            }
+
+            size_t allowed = session->snd_wnd - in_flight;
+
+
+
+
+            size_t chunk_len = std::min({session->snd_buf.size() - sent_offset, AETHON_MSS,allowed});
             uint64_t tx_buf_addr = tx_pool.back();
             tx_pool.pop_back();
             uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));

@@ -277,6 +277,7 @@ namespace aethon {
 
             // Outbound TCP Reliability State
             uint32_t snd_una{0};                       // Oldest unacknowledged sequence number
+            uint32_t snd_wnd{65535};                   // Client's advertised receive window (starts at 64 KB)
             static constexpr size_t MAX_SND_BUF = 256 * 1024; // 256 KB max in-flight
             std::vector<uint8_t> snd_buf;              // Data in-flight or waiting to be sent
             uint64_t last_tx_time_ns{0};               // Timestamp of last transmission
@@ -753,6 +754,9 @@ namespace aethon {
 
                 // Process client ACKs on established connections to slide outbound send window
                 if (AETHON_LIKELY(flags & TH_ACK)) {
+
+                    session->snd_wnd = static_cast<uint32_t>(ntohs(tcph->window)) << session->params.wscale;
+
                     uint32_t ack_seq = ntohl(tcph->ack_seq);
                     if (TcpSeq::gt(ack_seq, session->snd_una) && TcpSeq::lte(ack_seq, session->send_nxt)) {
                         size_t bytes_acked = ack_seq - session->snd_una;
