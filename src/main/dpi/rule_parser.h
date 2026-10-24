@@ -181,18 +181,27 @@ These keywords ONLY apply if there was a previous content keyword before them!
 */
 
 #pragma once
-#include "../../aethon/aethon.h"
+#include "aethon/aethon.h"
+
+#ifndef AETHON_ALWAYS_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define AETHON_ALWAYS_INLINE inline __attribute__((__always_inline__))
+#else
+#define AETHON_ALWAYS_INLINE inline
+#endif
+#endif
 #include <cstddef>
 #include <hs/hs.h>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 #include <array>
 #include <optional>
 #include <algorithm>
 #include <charconv>
-
+#include <filesystem>
 
 
 namespace aethon {
@@ -424,12 +433,17 @@ namespace aethon {
             else if (tokens[0] == "reject") rule.action = RuleAction::REJECT;
             else return std::nullopt;
             
-            //  Protocol
-            if (tokens[1] == "tcp")         rule.protocol = RuleProtocol::TCP;
-            else if (tokens[1] == "udp")    rule.protocol = RuleProtocol::UDP;
-            else if (tokens[1] == "icmp")   rule.protocol = RuleProtocol::ICMP;
-            else if (tokens[1] == "ip")     rule.protocol = RuleProtocol::ANY;
-            else return std::nullopt;
+            if (tokens[1] == "tcp" || tokens[1] == "http" || tokens[1] == "tls" || tokens[1] == "smtp" || tokens[1] == "ssh" || tokens[1] == "ftp") {
+                rule.protocol = RuleProtocol::TCP;
+            } else if (tokens[1] == "udp" || tokens[1] == "dns") {
+                rule.protocol = RuleProtocol::UDP;
+            } else if (tokens[1] == "icmp") {
+                rule.protocol = RuleProtocol::ICMP;
+            } else if (tokens[1] == "ip") {
+                rule.protocol = RuleProtocol::ANY;
+            } else {
+                return std::nullopt;
+            }
             
             // Ports
             rule.src_port = parse_port_range(tokens[3]);
@@ -609,6 +623,21 @@ namespace aethon {
             }
             return false;
         }
+
+        // load all rules
+        size_t load_from_directory(const std::string &dirpath){
+            size_t total = 0;
+            std::error_code ec;
+            if (!std::filesystem::exists(dirpath, ec)) return 0;
+            for(const auto &entry : std::filesystem::directory_iterator(dirpath,ec)){
+                if (entry.is_regular_file() && entry.path().extension() == ".rules") {
+                    total += load_from_file(entry.path().string());
+                }
+            }
+            return total;
+        }
+
+
 
         // Load an entire .rules file from disk
         size_t load_from_file(const std::string &filepath) {

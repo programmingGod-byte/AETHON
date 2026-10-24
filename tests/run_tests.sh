@@ -24,6 +24,10 @@ show_menu() {
     echo "9) C++20 Vectorized sendmmsg Blaster (Wire-Speed Mpps)"
     echo "10) Adversarial Chaos Torture Test (IMIX Sizes + Real Exploits)"
     echo "11) Stateful TCP Live Exploit & RST Torture Test (Triggers [ALERT] & [IPS BLOCK])"
+    echo "12) Python TLS SNI Domain Blocking & RST Injection Test"
+    echo "13) Python TLS Encrypted Payload Decryption & DPI Exploit Test"
+    echo "14) Full Functional TLS Test: Random Packets, Malicious Exploits & Flask Proxy"
+    echo "15) Multi-Port Reverse Proxy Test: Ports 5000, 6000 & 8080 Routing"
     echo "q) Exit"
     echo "=================================================="
 }
@@ -74,6 +78,40 @@ run_choice() {
             echo "🚀 Launching Stateful TCP Exploit & RST Torture Test..."
             sudo ip netns exec client_ns ./build/src/stateful_exploit_torture 192.168.50.1 4
             ;;
+        12)
+            echo "🚀 Launching TLS SNI Domain Blocking & RST Injection Test..."
+            sudo ip netns exec client_ns python3 tests/test_tls_sni.py 192.168.50.1 192.168.50.2 veth1
+            ;;
+        13)
+            echo "🚀 Launching TLS Encrypted Payload Decryption & DPI Exploit Test..."
+            sudo ip netns exec client_ns python3 tests/test_tls_payload.py 192.168.50.1 192.168.50.2 veth1 mydomain.com
+            ;;
+        14)
+            echo "🚀 Launching Full Functional TLS Decryption, DPI & Flask Proxy Test..."
+            BACKEND_STARTED=0
+            if ! ss -tuln | grep -q ":8080 "; then
+                echo "[*] Starting local backend server on port 8080..."
+                python3 tests/flask_backend.py 8080 &
+                BACKEND_PID=$!
+                BACKEND_STARTED=1
+                sleep 0.5
+            fi
+            sudo ip netns exec client_ns python3 tests/test_full_functional_tls.py 192.168.50.1 192.168.50.2 veth1 mydomain.com 8
+            if [ "$BACKEND_STARTED" -eq 1 ]; then
+                kill -9 $BACKEND_PID 2>/dev/null || true
+            fi
+            ;;
+        15)
+            echo "🚀 Launching Multi-Port (5000, 6000, 8080) Reverse Proxy & DPI Isolation Test..."
+            fuser -k 5000/tcp 6000/tcp 8080/tcp 2>/dev/null || true
+            sleep 0.2
+            python3 tests/multi_backend_server.py &
+            MULTI_PID=$!
+            sleep 0.8
+            sudo ip netns exec client_ns python3 tests/test_multi_port_forwarding.py 192.168.50.1 192.168.50.2 veth1
+            kill -9 $MULTI_PID 2>/dev/null || true
+            fuser -k 5000/tcp 6000/tcp 8080/tcp 2>/dev/null || true
+            ;;
         q|Q)
             exit 0
             ;;
@@ -88,7 +126,7 @@ if [ -n "$1" ]; then
     run_choice "$1"
 else
     show_menu
-    read -rp "Select test [1-7, q]: " CHOICE
+    read -rp "Select test [1-15, q]: " CHOICE
     run_choice "$CHOICE"
 fi
 

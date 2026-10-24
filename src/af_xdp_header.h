@@ -193,7 +193,7 @@ public:
   }
 
   bool setup(const char *ifname,
-             const char *prog_name = "src/main/xdp_kern_prog.o",
+             const char *prog_name = "src/main/ebpf/xdp_kern_prog.o",
              const char *prog_section_name = "aethon_xdp_prog_main",
              enum xdp_attach_mode xdp_running_mode = XDP_MODE_SKB,
              const char *xdp_xsk_map_name = "aethon_xsks_map",
@@ -219,20 +219,37 @@ public:
     }
     total_active_queues_ = num_queues;
 
-    // Adjust NIC channels via ethtool (silenced on virtual interfaces like veth)
-    std::string ethtool_cmd = "ethtool -L " + std::string(ifname) +
-                              " combined " + std::to_string(num_queues) + " >/dev/null 2>&1";
-    system(ethtool_cmd.c_str());
+    auto is_valid_ifname = [](const char *name) noexcept {
+      if (!name || *name == '\0') return false;
+      size_t len = 0;
+      for (; name[len] != '\0'; ++len) {
+        if (len >= IFNAMSIZ) return false;
+        char c = name[len];
+        bool is_valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!is_valid) return false;
+      }
+      return len > 0 && len < IFNAMSIZ;
+    };
+
+    if (AETHON_LIKELY(is_valid_ifname(ifname))) {
+      std::string ethtool_cmd = "ethtool -L " + std::string(ifname) +
+                                " combined " + std::to_string(num_queues) + " >/dev/null 2>&1";
+      int res = system(ethtool_cmd.c_str());
+      (void)res;
+    }
 
     // Automatically locate eBPF object whether executed from project root or build/src
     std::string resolved_prog = prog_name ? prog_name : "";
     if (resolved_prog.empty() || access(resolved_prog.c_str(), F_OK) != 0) {
       const char *fallbacks[] = {
+          "src/main/ebpf/xdp_kern_prog.o",
+          "../../src/main/ebpf/xdp_kern_prog.o",
+          "../src/main/ebpf/xdp_kern_prog.o",
           "src/main/xdp_kern_prog.o",
           "../../src/main/xdp_kern_prog.o",
           "../src/main/xdp_kern_prog.o",
-          "./xdp_kern_prog.o",
-          "/home/shivam/Desktop/learning/advanceCpp/Aethon/src/main/xdp_kern_prog.o"
+          "./xdp_kern_prog.o"
       };
       for (const char *fb : fallbacks) {
         if (access(fb, F_OK) == 0) {
@@ -276,12 +293,12 @@ public:
       uint16_t TOKEN = 1;
       uint16_t WINDOW = 2;
       uint16_t LIMIT = 3;
-      uint64_t valueT = 10;
-      uint64_t valueW = 10;
-      uint64_t valueL = 10;
-      bpf_map_update_elem(params_fd, &TOKEN, &valueT, BPF_NOEXIST);
-      bpf_map_update_elem(params_fd, &WINDOW, &valueW, BPF_NOEXIST);
-      bpf_map_update_elem(params_fd, &LIMIT, &valueL, BPF_NOEXIST);
+      uint64_t valueT = 100000ULL;
+      uint64_t valueW = 10ULL;
+      uint64_t valueL = 50000ULL;
+      bpf_map_update_elem(params_fd, &TOKEN, &valueT, BPF_ANY);
+      bpf_map_update_elem(params_fd, &WINDOW, &valueW, BPF_ANY);
+      bpf_map_update_elem(params_fd, &LIMIT, &valueL, BPF_ANY);
     }
   }
     // Pass queue count to eBPF map

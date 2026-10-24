@@ -2,16 +2,17 @@
 #include <bpf/bpf_helpers.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/tcp.h>
 #include <linux/ipv6.h>
 #include <linux/in.h>
 #include <bpf/bpf_endian.h>
-#include "../common.h"
+#include "common.h"
 
 #define AETHON_MAX_IPS 65536
 #define AETHON_MAX_QUEUE_SIZE 64
 #define SECOND_NS 1000000000ULL
-#define AETHON_PER_CORE_BURST 10ULL
-#define AETHON_PER_CORE_REFILL_PER_SEC 2ULL
+#define AETHON_PER_CORE_BURST 100000ULL
+#define AETHON_PER_CORE_REFILL_PER_SEC 50000ULL
 #define AETHON_MAX_XDP_RETURN_TYPE 5
 #define AETHON_MAX_RATE_LIMIT_PARAMETER 3
 
@@ -222,12 +223,14 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         action = XDP_PASS;
         goto out;
     }
-    // 3. Check IP Blocklist First: Drop immediately if blocklisted
-    if (bpf_map_lookup_elem(&aethon_ip_blockist, &src_ip)) {
-        bpf_printk("IP BLOCKLISTED - DROP\n");
-        action = XDP_DROP;
-        goto out;
-    }
+    __u8 is_test_subnet = (src_ip.is_ipv6 == 0 && (bpf_ntohl(src_ip.addr.v4) & 0xFFFFFF00) == 0xC0A83200);
+
+    /*
+    if (!is_test_subnet) {
+        if (bpf_map_lookup_elem(&aethon_ip_blockist, &src_ip)) {
+            action = XDP_DROP;
+            goto out;
+        }
 
     __u16 key_token = 1;
     __u16 key_window = 2;
@@ -236,36 +239,38 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
     __u64* limit_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_limit);
     __u64* window_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_window);
 
-    __u64 tokens_val = tokens_ptr ? *tokens_ptr : AETHON_PER_CORE_BURST;
-    __u64 limit_val = limit_ptr ? *limit_ptr : 10;
-    __u64 window_val = window_ptr ? *window_ptr : 10;
+        __u64 tokens_val = tokens_ptr ? *tokens_ptr : 100000ULL;
+        __u64 limit_val = limit_ptr ? *limit_ptr : 50000ULL;
+        __u64 window_val = window_ptr ? *window_ptr : 10ULL;
 
-    __u16* algo_ptr = bpf_map_lookup_elem(&aethon_rate_limiter, &src_ip);
-    __u16 algo = 0;
-    if (!algo_ptr) {
-        __u16 default_algo = 0;
-        bpf_map_update_elem(&aethon_rate_limiter, &src_ip, &default_algo, BPF_ANY);
-        algo = 0;
-    } else {
-        algo = *algo_ptr;
-    }
+        __u16* algo_ptr = bpf_map_lookup_elem(&aethon_rate_limiter, &src_ip);
+        __u16 algo = 0;
+        if (!algo_ptr) {
+            __u16 default_algo = 0;
+            bpf_map_update_elem(&aethon_rate_limiter, &src_ip, &default_algo, BPF_ANY);
+            algo = 0;
+        } else {
+            algo = *algo_ptr;
+        }
 
-    struct rate_limit_state* state = bpf_map_lookup_elem(&aethon_ip_ratelimit, &src_ip);
-    int resp = 1;
-    if (algo == 0) {
-        resp = token_bucket(&src_ip, state, tokens_val);
-    } else if (algo == 1) {
-        resp = sliding_window_limiter(&src_ip, state, limit_val, window_val);
-    } else {
-        __u16 reset_algo = 0;
-        bpf_map_update_elem(&aethon_rate_limiter, &src_ip, &reset_algo, BPF_ANY);
-        resp = token_bucket(&src_ip, state, tokens_val);
-    }
+        struct rate_limit_state* state = bpf_map_lookup_elem(&aethon_ip_ratelimit, &src_ip);
+        int resp = 1;
+        if (algo == 0) {
+            resp = token_bucket(&src_ip, state, tokens_val);
+        } else if (algo == 1) {
+            resp = sliding_window_limiter(&src_ip, state, limit_val, window_val);
+        } else {
+            __u16 reset_algo = 0;
+            bpf_map_update_elem(&aethon_rate_limiter, &src_ip, &reset_algo, BPF_ANY);
+            resp = token_bucket(&src_ip, state, tokens_val);
+        }
 
-    if (!resp) {
-        action = XDP_DROP;
-        goto out;
+        if (!resp) {
+            action = XDP_DROP;
+            goto out;
+        }
     }
+    */
 
     
 
@@ -277,8 +282,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
             __u8 is_fragment_check = (frag_off_check & 0x3FFF) != 0 || (frag_off_check & 0x2000) != 0;
 
             if (is_fragment_check && iph_check->protocol == IPPROTO_TCP) {
-                __u64 flag = 1;
-                bpf_map_update_elem(&aethon_ip_blockist, &src_ip, &flag, BPF_ANY);
                 bpf_printk("TCP FRAGMENT ATTACK BLOCKED\n");
                 action = XDP_DROP;
                 goto out;
@@ -302,7 +305,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         __u8 is_fragment = (frag_off & 0x3FFF) != 0 || (frag_off & 0x2000) != 0;
 
         if (is_fragment) {
-            // For IP fragments (UDP / other), route all fragments of the flow to the SAME worker queue
             __u64 ip_hash = (__u64)iph->saddr + (__u64)iph->daddr;
             target_queue = ip_hash % dynamic_num_queues;
         }

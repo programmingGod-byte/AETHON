@@ -31,25 +31,22 @@ else()
     )
 endif()
 
-set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "Don't update dependencies on reconfigure")
+option(FLUXIO_USE_LOCAL "" OFF)
 
 set(FLUXIO_BUILD_PYTHON OFF CACHE INTERNAL "")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/FluxIO/CMakeLists.txt")
+if(FLUXIO_USE_LOCAL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/FluxIO/CMakeLists.txt")
     FetchContent_Declare(
         FluxIO
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/extern/FluxIO
-    )
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/_deps/fluxio-src/CMakeLists.txt")
-    FetchContent_Declare(
-        FluxIO
-        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/_deps/fluxio-src
     )
 else()
     FetchContent_Declare(
         FluxIO
         GIT_REPOSITORY https://github.com/programmingGod-byte/FluxIO.git
         GIT_TAG        main
+        UPDATE_DISCONNECTED FALSE
     )
+    set(FETCHCONTENT_UPDATES_DISCONNECTED_FLUXIO OFF CACHE BOOL "" FORCE)
 endif()
 FetchContent_MakeAvailable(CLI11 FluxIO)
 
