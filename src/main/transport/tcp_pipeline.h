@@ -279,7 +279,15 @@ namespace pipeline {
                     }
 
                     if(target_port > 0 && res.session){
+                        int prev_fd = res.session->backend_fd;
                         res.session->forward_to_backend(res.payload, res.payload_len, target_port);
+
+                        if(AETHON_LIKELY(epfd >=0 && res.session->backend_fd >=0 && prev_fd != res.session->backend_fd)){
+                            struct epoll_event ev{};
+                            ev.events = EPOLLIN | EPOLLRDHUP;
+                            ev.data.ptr = res.session;
+                            epoll_ctl(epfd, EPOLL_CTL_ADD, res.session->backend_fd, &ev);
+                        }
                     }
                 }
             }
@@ -312,11 +320,17 @@ namespace pipeline {
             uint8_t resp_buf[16384];
             ssize_t n = session->read_from_backend(resp_buf, sizeof(resp_buf));
             if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(n > 0, 1, 0.90)) {
-                session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
-                uint8_t enc_tx[16384];
-                int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
-                if (AETHON_LIKELY(enc_len > 0)) {
-                    if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+                if (session->tls_conn.is_established()) {
+                    session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
+                    uint8_t enc_tx[16384];
+                    int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
+                    if (AETHON_LIKELY(enc_len > 0)) {
+                        if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+                            work_done++;
+                        }
+                    }
+                } else {
+                    if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
                         work_done++;
                     }
                 }
