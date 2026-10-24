@@ -2,6 +2,7 @@
 
 #include "aethon/aethon.h"
 #include "af_xdp_header.h"
+#include <algorithm>
 #include <cstring>
 #include <liburing.h>
 #include <vector>
@@ -55,47 +56,100 @@ namespace pipeline {
         size_t len,
         std::vector<uint64_t> &tx_pool
     ) noexcept {
-        if (AETHON_UNLIKELY(!sock || !session || !data || len == 0)) {
+        if (AETHON_UNLIKELY(!sock || !session)) {
             return false;
         }
 
-        constexpr size_t AETHON_MSS = 1460;
-        size_t offset = 0;
-        bool all_sent = true;
+        // if new data append to the snd_buf
 
-        while (offset < len) {
-            if (AETHON_UNLIKELY(tx_pool.empty())) {
-                all_sent = false;
-                break;
+        if(data && len > 0){
+            if(session->snd_buf.size() + len > session->MAX_SND_BUF){
+                return false; // buffer full
             }
 
-            size_t chunk_len = std::min(len - offset, AETHON_MSS);
+            session->snd_buf.insert(session->snd_buf.end(),data,data  + len);
+        }
+
+        constexpr size_t AETHON_MSS = 1460;
+        size_t sent_offset = session->send_nxt - session->snd_una;
+
+        while (sent_offset < session->snd_buf.size()) {
+            if(AETHON_UNLIKELY(tx_pool.empty())){
+                break;
+            }
+            size_t chunk_len = std::min(session->snd_buf.size() - sent_offset, AETHON_MSS);
             uint64_t tx_buf_addr = tx_pool.back();
             tx_pool.pop_back();
-
             uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
             AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
-
+            // Send the chunk from snd_buf:
             bool sent = net::PacketInjector::ipv4_send_tcp_data(
                 sock, tx_buf_addr, pkt,
                 session->client_mac, session->server_mac,
                 session->key.src_ip, session->key.dst_ip,
                 session->key.src_port, session->key.dst_port,
                 session->send_nxt, session->rcv_nxt,
-                data + offset, chunk_len,
+                session->snd_buf.data() + sent_offset, chunk_len, // <-- data from snd_buf!
                 session->recv_window());
-
             if (AETHON_LIKELY(sent)) {
                 session->send_nxt += chunk_len;
-                offset += chunk_len;
+                sent_offset += chunk_len;
+                // Record timestamp for RTO timer:
+                session->last_tx_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
             } else {
                 tx_pool.push_back(tx_buf_addr);
-                all_sent = false;
                 break;
             }
+        
         }
 
-        return all_sent;
+        
+        return (sent_offset == session->snd_buf.size());
+    }
+
+    AETHON_ALWAYS_INLINE bool retransmit_unacked_data(
+        xdp::aethon_xsk_socket_info * __restrict__ sock,
+        IPv4TcpAssembler::TcpStreamSession * __restrict__ session,
+        std::vector<uint64_t> &tx_pool
+    ) noexcept {
+        if (!sock || !session || session->snd_buf.empty() || tx_pool.empty()) {
+            return false;
+        }
+
+        constexpr size_t AETHON_MSS = 1460;
+        size_t in_flight = session->send_nxt - session->snd_una;
+        if (in_flight == 0) return false;
+
+        // Oldest unacknowledged segment is located at index 0 of snd_buf
+        size_t chunk_len = std::min(std::min(in_flight, session->snd_buf.size()), AETHON_MSS);
+        uint64_t tx_buf_addr = tx_pool.back();
+        tx_pool.pop_back();
+
+        uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
+        AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
+
+        // Retransmit starting from snd_una
+        bool sent = net::PacketInjector::ipv4_send_tcp_data(
+            sock, tx_buf_addr, pkt,
+            session->client_mac, session->server_mac,
+            session->key.src_ip, session->key.dst_ip,
+            session->key.src_port, session->key.dst_port,
+            session->snd_una, session->rcv_nxt,
+            session->snd_buf.data(), chunk_len,
+            session->recv_window());
+
+        if (AETHON_LIKELY(sent)) {
+            session->last_tx_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            // Karn's algorithm: exponential backoff doubling RTO up to 2000 ms
+            session->rto_ms = std::min(session->rto_ms * 2, 2000u);
+            session->retransmit_count++;
+            return true;
+        } else {
+            tx_pool.push_back(tx_buf_addr);
+            return false;
+        }
     }
 
     template <typename Scanner>
@@ -146,6 +200,11 @@ namespace pipeline {
 
             constexpr uint32_t initial_server_isn  = 1000000;
             res.session->send_nxt = initial_server_isn + 1;
+
+            res.session->send_nxt = initial_server_isn + 1;
+            res.session->snd_una = initial_server_isn + 1;
+
+
             return net::PacketInjector::ipv4_send_tcp_syn_ack(
                 sock, buf_addr, pkt, eth, iph, tcph, initial_server_isn, ntohl(tcph->seq));
         }
@@ -161,7 +220,6 @@ namespace pipeline {
             const uint8_t * hello_data = res.payload;
             size_t hello_len = res.payload_len;
 
-            // Bug B fix: Bound the TLS ClientHello buffer to prevent memory exhaustion (CWE-400).
             // RFC 8446 limits the maximum TLS record payload to 2^14 (16384) bytes + 5-byte header.
             static constexpr size_t MAX_CLIENT_HELLO = 16384 + 5;
 
@@ -286,7 +344,7 @@ namespace pipeline {
                             }
                             if(target_port > 0){
                                 int prev_fd = res.session->backend_fd;
-                                // Bug A fix: Protect against unbounded memory growth in backend_tx_buf (CWE-400 / CWE-770)
+                                //  Protect against unbounded memory growth in backend_tx_buf (CWE-400 / CWE-770)
                                 if (AETHON_UNLIKELY(!res.session->forward_to_backend(plain_buf, plain_len, target_port))) {
                                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
                                     return net::PacketInjector::ipv4_send_tcp_rst(
@@ -415,7 +473,45 @@ namespace pipeline {
     }
 
     
-        AETHON_ALWAYS_INLINE uint32_t drain_backend_events(
+    AETHON_ALWAYS_INLINE uint32_t check_tcp_retransmissions(
+        xdp::aethon_xsk_socket_info * __restrict__ sock,
+        std::vector<uint64_t> &tx_pool,
+        IPv4TcpAssembler::TcpAssemblerEngine &tcp_engine
+    ) noexcept {
+        static uint64_t last_rto_sweep_ns = 0;
+        uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        // RTO Sweep: Check once every 100 ms across active TCP sessions
+        if (AETHON_LIKELY(now_ns - last_rto_sweep_ns < 100000000ULL)) {
+            return 0;
+        }
+        last_rto_sweep_ns = now_ns;
+
+        uint32_t retransmitted = 0;
+        tcp_engine.for_each_session([&](IPv4TcpAssembler::TcpStreamSession *session) {
+            if (session && session->state == IPv4TcpAssembler::TcpState::ESTABLISHED) {
+                // Check if session has unacknowledged in-flight data
+                if (session->snd_una != session->send_nxt && !session->snd_buf.empty()) {
+                    uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
+                    if (now_ns - session->last_tx_time_ns > rto_ns) {
+                        if (session->retransmit_count >= 5) {
+                            // Max retries exceeded: remote client is dead, close session
+                            tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
+                        } else {
+                            if (retransmit_unacked_data(sock, session, tx_pool)) {
+                                retransmitted++;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        return retransmitted;
+    }
+
+    AETHON_ALWAYS_INLINE uint32_t drain_backend_events(
         int epfd,
         xdp::aethon_xsk_socket_info * __restrict__ sock,
         std::vector<uint64_t> &tx_pool,
@@ -429,6 +525,7 @@ namespace pipeline {
         if (AETHON_LIKELY(nfds <= 0)) return 0;
 
         uint32_t work_done = 0;
+
         for (int i = 0; i < nfds; ++i) {
             auto *session = reinterpret_cast<IPv4TcpAssembler::TcpStreamSession *>(events[i].data.ptr);
             if (AETHON_UNLIKELY(!session || session->backend_fd < 0)) continue;
@@ -471,25 +568,28 @@ namespace pipeline {
             bool backend_closed = (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
 
             if (events[i].events & EPOLLIN) {
-                uint8_t resp_buf[16384];
-                ssize_t n = session->read_from_backend(resp_buf, sizeof(resp_buf));
-                if (n > 0) {
-                    if (session->tls_conn.is_established()) {
-                        session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
-                        uint8_t enc_tx[16384];
-                        int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
-                        if (AETHON_LIKELY(enc_len > 0)) {
-                            if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+                // End-to-end backpressure: only read from backend if outbound send buffer has space
+                if (session->snd_buf.size() < session->MAX_SND_BUF) {
+                    uint8_t resp_buf[16384];
+                    ssize_t n = session->read_from_backend(resp_buf, sizeof(resp_buf));
+                    if (n > 0) {
+                        if (session->tls_conn.is_established()) {
+                            session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
+                            uint8_t enc_tx[16384];
+                            int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
+                            if (AETHON_LIKELY(enc_len > 0)) {
+                                if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+                                    work_done++;
+                                }
+                            }
+                        } else {
+                            if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
                                 work_done++;
                             }
                         }
-                    } else {
-                        if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
-                            work_done++;
-                        }
+                    } else if (n == 0) {
+                        backend_closed = true;
                     }
-                } else if (n == 0) {
-                    backend_closed = true;
                 }
             }
 

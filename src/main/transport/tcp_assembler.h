@@ -269,6 +269,20 @@ namespace aethon {
             std::vector<uint8_t> backend_tx_buf;
             bool epollout_armed{false};
 
+            /*
+                send_una                                       send_nxt
+            [Already Acked]| In flight in snd_buf(3KB)   |    (Not sent yet)    ]     
+
+            */
+
+            // Outbound TCP Reliability State
+            uint32_t snd_una{0};                       // Oldest unacknowledged sequence number
+            static constexpr size_t MAX_SND_BUF = 256 * 1024; // 256 KB max in-flight
+            std::vector<uint8_t> snd_buf;              // Data in-flight or waiting to be sent
+            uint64_t last_tx_time_ns{0};               // Timestamp of last transmission
+            uint32_t rto_ms{200};                       // RTO in milliseconds (starts at 200ms)
+            uint8_t retransmit_count{0};               // Number of retransmissions
+
 
             // Compute dynamic receive window based on remaining buffer capacity
             AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
@@ -563,6 +577,16 @@ namespace aethon {
                 TcpAssemblerEngine (const TcpAssemblerEngine&) = delete;
                 TcpAssemblerEngine &operator=(const TcpAssemblerEngine &) = delete;
 
+                template <typename Fn>
+                void for_each_session(Fn &&fn) noexcept {
+                    for (size_t i = 0; i < sessions_.capacity(); ++i) {
+                        auto *cell = &sessions_.cells()[i];
+                        if (cell->key != KemptyTcpKey && cell->val) {
+                            fn(cell->val);
+                        }
+                    }
+                }
+
                 void clear() noexcept{
                     for(size_t i = 0; i< sessions_.capacity(); i++){
                         auto *cell = &sessions_.cells()[i];
@@ -713,21 +737,37 @@ namespace aethon {
                 }
 
 
-                // . Transition: First packet after SYN moves session to ESTABLISHED
-                // previous 
-                       
+                // Transition: First packet after SYN moves session to ESTABLISHED
                 if (AETHON_UNLIKELY(session->state == TcpState::SYN_SENT)) {
                     if (AETHON_LIKELY(flags & TH_ACK)) {
                         session->state = TcpState::ESTABLISHED;
                     } else {
-                       
                         return result;
                     }
                 }
 
-                 // If connection is not ESTABLISHED, ignore data
+                // If connection is not ESTABLISHED, ignore data
                 if (AETHON_UNLIKELY(session->state != TcpState::ESTABLISHED)) {
                     return result;
+                }
+
+                // Process client ACKs on established connections to slide outbound send window
+                if (AETHON_LIKELY(flags & TH_ACK)) {
+                    uint32_t ack_seq = ntohl(tcph->ack_seq);
+                    if (TcpSeq::gt(ack_seq, session->snd_una) && TcpSeq::lte(ack_seq, session->send_nxt)) {
+                        size_t bytes_acked = ack_seq - session->snd_una;
+                        if (bytes_acked <= session->snd_buf.size()) {
+                            session->snd_buf.erase(session->snd_buf.begin(), session->snd_buf.begin() + bytes_acked);
+                        } else {
+                            session->snd_buf.clear();
+                        }
+
+                        session->snd_una = ack_seq;
+                        // Successful ACK: reset RTO timer and retry counter
+                        session->rto_ms = 200;
+                        session->retransmit_count = 0;
+                        session->last_tx_time_ns = now_ns;
+                    }
                 }
 
                 // process data payload
