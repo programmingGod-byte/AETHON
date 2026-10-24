@@ -182,6 +182,14 @@ These keywords ONLY apply if there was a previous content keyword before them!
 
 #pragma once
 #include "aethon/aethon.h"
+
+#ifndef AETHON_ALWAYS_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define AETHON_ALWAYS_INLINE inline __attribute__((__always_inline__))
+#else
+#define AETHON_ALWAYS_INLINE inline
+#endif
+#endif
 #include <cstddef>
 #include <hs/hs.h>
 #include <cstdint>

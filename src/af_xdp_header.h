@@ -219,10 +219,25 @@ public:
     }
     total_active_queues_ = num_queues;
 
-    // Adjust NIC channels via ethtool (silenced on virtual interfaces like veth)
-    std::string ethtool_cmd = "ethtool -L " + std::string(ifname) +
-                              " combined " + std::to_string(num_queues) + " >/dev/null 2>&1";
-    system(ethtool_cmd.c_str());
+    auto is_valid_ifname = [](const char *name) noexcept {
+      if (!name || *name == '\0') return false;
+      size_t len = 0;
+      for (; name[len] != '\0'; ++len) {
+        if (len >= IFNAMSIZ) return false;
+        char c = name[len];
+        bool is_valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!is_valid) return false;
+      }
+      return len > 0 && len < IFNAMSIZ;
+    };
+
+    if (AETHON_LIKELY(is_valid_ifname(ifname))) {
+      std::string ethtool_cmd = "ethtool -L " + std::string(ifname) +
+                                " combined " + std::to_string(num_queues) + " >/dev/null 2>&1";
+      int res = system(ethtool_cmd.c_str());
+      (void)res;
+    }
 
     // Automatically locate eBPF object whether executed from project root or build/src
     std::string resolved_prog = prog_name ? prog_name : "";

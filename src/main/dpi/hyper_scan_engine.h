@@ -1,5 +1,13 @@
 #pragma once
 #include "aethon/aethon.h"
+
+#ifndef AETHON_ALWAYS_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define AETHON_ALWAYS_INLINE inline __attribute__((__always_inline__))
+#else
+#define AETHON_ALWAYS_INLINE inline
+#endif
+#endif
 #include "hs_common.h"
 #include "hs_compile.h"
 #include "hs_runtime.h"
@@ -214,7 +222,7 @@ namespace aethon {
                         flags.data(),
                         ids.data(),
                         static_cast<unsigned int>(expressions.size()),
-                        HS_MODE_BLOCK,
+                        HS_MODE_STREAM,
                         nullptr,
                         &db_,
                         &compile_err
@@ -336,6 +344,21 @@ namespace aethon {
                     return false;
                 }
 
+                hs_stream_t *stream = nullptr;
+                if (AETHON_UNLIKELY(hs_open_stream(db_, 0, &stream) != HS_SUCCESS)) {
+                    return false;
+                }
+
+                bool matched = scan_stream(stream, payload, payload_len);
+                hs_close_stream(stream, scratch_, nullptr, nullptr);
+                return matched;
+            }
+
+            AETHON_ALWAYS_INLINE bool scan_stream(hs_stream_t *stream, const uint8_t * __restrict__ payload, size_t payload_len) noexcept {
+                if (AETHON_UNLIKELY(!stream || !scratch_ || !payload || payload_len == 0)) {
+                    return false;
+                }
+
                 AETHON_BUILTIN_PREFETCH(payload, 0, 3);
 
                 MatchContext ctx;
@@ -345,8 +368,8 @@ namespace aethon {
                 ctx.payload_len = payload_len;
                 ctx.match_count = 0;
 
-                hs_error_t err = hs_scan(
-                    db_,
+                hs_error_t err = hs_scan_stream(
+                    stream,
                     reinterpret_cast<const char *>(payload),
                     static_cast<unsigned int>(payload_len),
                     0,
@@ -357,6 +380,17 @@ namespace aethon {
 
                 return (err == HS_SUCCESS) && (ctx.match_count > 0);
             }
+
+            AETHON_ALWAYS_INLINE hs_stream_t* open_stream() const noexcept {
+                if (AETHON_UNLIKELY(!db_)) return nullptr;
+                hs_stream_t *stream = nullptr;
+                if (hs_open_stream(db_, 0, &stream) != HS_SUCCESS) {
+                    return nullptr;
+                }
+                return stream;
+            }
+
+
 
             AETHON_ALWAYS_INLINE bool is_ready() const noexcept {
                 return db_ != nullptr && scratch_ != nullptr;

@@ -1,5 +1,6 @@
 #include "af_xdp_header.h"
 #include "aethon/aethon.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -9,6 +10,7 @@
 #include <netinet/udp.h>
 #include <netinet/ip_icmp.h>
 #include <openssl/evp.h>
+#include <sys/epoll.h>
 #include <thread>
 #include <vector>
 #include <chrono>
@@ -24,7 +26,7 @@
 #include <bpf/libbpf.h>
 #include <unistd.h>
 #include <sys/stat.h>
-
+#include <immintrin.h>
 
 /*
   For IPv4 UDP
@@ -70,20 +72,48 @@ static inline uint16_t get_checksum(const uint8_t *pkt,size_t len){
   return static_cast<uint16_t>(~sum);
 }
 
-static inline void free_completion_ring(aethon_xsk_socket_info* sock){
-  uint32_t idx=0;
-  unsigned int completed=xsk_ring_cons__peek(&sock->umen->cq,32,&idx);
-  if (AETHON_LIKELY(completed==0)) return;
-  uint32_t idx_fq=0;
-  unsigned int avail=xsk_ring_prod__reserve(&sock->umen->fq,completed,&idx_fq);
-  if (AETHON_UNLIKELY(avail==0)) return;
-  for (unsigned int i = 0; i < avail; ++i) {
-    uint64_t addr=*xsk_ring_cons__comp_addr(&sock->umen->cq,idx+i);
-    *xsk_ring_prod__fill_addr(&sock->umen->fq,idx_fq+i)=addr;
+
+// free completion ring
+template<typename Config>
+static inline void free_completion_ring(aethon_xsk_socket_info *sock, std::vector<uint64_t>& tx_pool){
+  uint32_t idx = 0;
+  unsigned int completed = xsk_ring_cons__peek(&sock->umen->cq, Config::BATCH_SIZE, &idx);
+  if(AETHON_LIKELY(completed ==0 )) return;
+
+  // dividing line
+  constexpr uint64_t tx_boundary = Config::FQ_RING_SIZE * Config::FRAME_SIZE;
+  uint32_t rx_count = 0;
+  uint64_t rx_addrs[Config::BATCH_SIZE];
+
+
+  for(unsigned int i = 0; i< completed;i++){
+    uint64_t addr = *xsk_ring_cons__comp_addr(&sock->umen->cq, idx +1);
+    if(addr >= tx_boundary){
+      // it came from the tx poll
+      tx_pool.push_back(addr);
+    }else{
+      rx_addrs[rx_count++] = addr;
+    }
   }
-  xsk_ring_prod__submit(&sock->umen->fq,avail);
-  xsk_ring_cons__release(&sock->umen->cq,avail);
+
+  // return the rx frame back to nic fill ring
+
+  if(rx_count > 0){
+    uint32_t idx_fq = 0;
+    unsigned int avail = xsk_ring_prod__reserve(&sock->umen->fq, rx_count, &idx_fq);
+    if(avail > 0){
+      for (unsigned int i = 0; i < avail; ++i) {
+        *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq + i) = rx_addrs[i];
+      }
+      xsk_ring_prod__submit(&sock->umen->fq, avail);
+    }
+  }
+
+
+   xsk_ring_cons__release(&sock->umen->cq, completed);
 }
+
+
 
 // Templated worker that accepts any AFXDPEngine configuration
 template <typename Engine>
@@ -124,33 +154,66 @@ void rx_worker(Engine &engine, int queue_id) {
   IPv4TcpAssembler::TcpAssemblerEngine tcp_assembler;
   auto scanner = g_master_scanner.create_worker();
 
+
+  uint32_t idle_iters = 0;
+  constexpr uint32_t SPIN_LIMIT = 2048;
+
+  std::vector<uint64_t> tx_pool;
+  tx_pool.reserve(Config::NUM_FRAMES  - Config::FQ_RING_SIZE);
+  for (size_t i = Config::FQ_RING_SIZE; i < Config::NUM_FRAMES; ++i) {
+    tx_pool.push_back(i * Config::FRAME_SIZE);
+  }
+
+
+  // if this program call the execve() to spawn another process close the poll descriptor
+  int epfd = epoll_create1(EPOLL_CLOEXEC);
   while (g_running.load(std::memory_order_relaxed)) {
+    
     uint32_t idx_rx = 0;
     unsigned int rcvd = xsk_ring_cons__peek(&sock->rx, Config::BATCH_SIZE, &idx_rx);
-    free_completion_ring(sock);
+        free_completion_ring<Config>(sock, tx_pool);
+
+    uint32_t backend_work = pipeline::drain_backend_events(epfd, sock, tx_pool);
+    if(AETHON_UNLIKELY(backend_work > 0)){
+      idle_iters = 0;
+    }
     
-    if (AETHON_UNLIKELY(!rcvd)) {
-        while (!fallback_ring.empty()) {
-            uint32_t idx_fq = 0;
-            size_t count = std::min(fallback_ring.size(), static_cast<size_t>(Config::BATCH_SIZE));
-            size_t available = xsk_ring_prod__reserve(&sock->umen->fq, count, &idx_fq);
-            if (AETHON_UNLIKELY(available == 0)) {
-                break;
-            }
-            for (size_t i = 0; i < available; ++i) {
-                *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq + i) = fallback_ring.get(i);
-            }
-            xsk_ring_prod__submit(&sock->umen->fq, available);
-            fallback_ring.advance(available);
+
+    if(AETHON_UNLIKELY(!rcvd)){
+      while (!fallback_ring.empty()) {
+        uint32_t idx_fq = 0;
+        size_t count  = std::min(fallback_ring.size(), static_cast<size_t>(Config::BATCH_SIZE));
+        size_t available = xsk_ring_prod__reserve(&sock->umen->fq, count, &idx_fq);
+        if(AETHON_UNLIKELY(available == 0)){
+          break;
         }
 
-        if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->umen->fq))) {
+        for(size_t i = 0; i<available;i++){
+          *xsk_ring_prod__fill_addr(&sock->umen->fq, idx_fq + i) = fallback_ring.get(i);
+        }
+        xsk_ring_prod__submit(&sock->umen->fq, available);
+        fallback_ring.advance(available);
+
+      }
+
+      if(++idle_iters < SPIN_LIMIT){
+        #if defined (__x86_64)
+        _mm_pause();
+        #endif
+        continue;
+      }
+
+      if (AETHON_UNLIKELY(xsk_ring_prod__needs_wakeup(&sock->umen->fq))) {
             recvfrom(sock_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
         }
 
-        poll(fds, 1, 50);
+                poll(fds, 1, 10);
+        idle_iters = 0;
         continue;
+
     }
+
+    idle_iters = 0;
 
     uint64_t batch_bytes = 0;
     for (unsigned int i = 0; i < rcvd; ++i) {
@@ -240,8 +303,8 @@ void rx_worker(Engine &engine, int queue_id) {
             uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
 
-            bool is_blocked = pipeline::handle_tcp_packet(
-                sock, desc->addr, pkt, eth, iph, ip_total_len, now_ns, tcp_assembler, scanner);
+                                    bool is_blocked = pipeline::handle_tcp_packet(
+                sock, desc->addr, pkt, eth, iph, ip_total_len, now_ns, tcp_assembler, scanner, tx_pool, epfd);
             if (AETHON_UNLIKELY(is_blocked)) {
               continue;
             }
@@ -331,6 +394,9 @@ inline void stats_printer() {
   uint64_t last_bytes = 0;
 
   while (g_running.load(std::memory_order_relaxed)) {
+
+
+
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
     uint64_t current_packets = g_stats.total_packets.load(std::memory_order_relaxed);
@@ -455,10 +521,12 @@ int main(int argc, char **argv) {
   int num_queues = engine.active_queues();
   std::cout << "Running on " << num_queues << " queues...\n";
 
-  // Spawn 1 thread per queue
+  pin_xdp_map(engine, engine.find_map("aethon_ip_blockist"), "aethon_ip_blockist");
+  pin_xdp_map(engine, engine.find_map("aethon_rate_limiter"), "aethon_rate_limiter");
+  pin_xdp_map(engine, engine.find_map("rate_limiter_params"), "rate_limiter_params");
+
   std::vector<std::thread> workers;
   
-  // Start the statistics printer thread
   workers.emplace_back(stats_printer);
 
   for (int q = 0; q < num_queues; ++q) {
@@ -468,9 +536,6 @@ int main(int argc, char **argv) {
   for (auto &w : workers) {
     w.join();
   }
-  pin_xdp_map(engine,engine.find_map("aethon_ip_blockist"),"aethon_ip_blockist");
-  pin_xdp_map(engine,engine.find_map("aethon_rate_limiter"),"aethon_rate_limiter");
-  pin_xdp_map(engine,engine.find_map("rate_limiter_params"),"rate_limiter_params");
   std::cout << "\n[Engine] Gracefully stopped all workers.\n";
   return 0;
 }

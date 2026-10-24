@@ -63,7 +63,17 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 
 */
 #pragma once
+#include <hs/hs.h>
 #include "aethon/aethon.h"
+
+#ifndef AETHON_ALWAYS_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define AETHON_ALWAYS_INLINE inline __attribute__((__always_inline__))
+#else
+#define AETHON_ALWAYS_INLINE inline
+#endif
+#endif
+
 #include "aethon/single_thread_hasmap.h"
 #include "tls_engine.h"
 #include <array>
@@ -231,6 +241,7 @@ namespace aethon {
             const uint8_t *payload{nullptr};
             size_t payload_len{0};
             TcpStreamSession *session{nullptr};
+            hs_stream_t *hs_stream{nullptr};
         };
 
         
@@ -252,6 +263,11 @@ namespace aethon {
 
             int backend_fd {-1};
             uint16_t backend_port {0};
+            hs_stream_t *hs_stream{nullptr};
+
+            uint8_t client_mac[6]{0};
+            uint8_t server_mac[6]{0};
+            uint32_t send_nxt{0};
 
             TcpStreamSession() = default;
 
@@ -269,6 +285,11 @@ namespace aethon {
                 if (bitmap) {
                     std::free(bitmap);
                     bitmap = nullptr;
+                }
+
+                if(hs_stream){
+                    hs_close_stream(hs_stream, nullptr, nullptr, nullptr);
+                    hs_stream = nullptr;
                 }
             }
             TcpStreamSession(const TcpStreamSession &) = delete;
@@ -332,20 +353,11 @@ namespace aethon {
 
 
             AETHON_ALWAYS_INLINE ssize_t read_from_backend(uint8_t * buf, size_t max_len, int timeout_ms = 50) noexcept {
-                if(AETHON_UNLIKELY(backend_fd < 0 || !buf || max_len == 0)){
+                 if(AETHON_UNLIKELY(backend_fd < 0 || !buf || max_len == 0)){
                     return 0;
                 }
-
-                struct pollfd pfd;
-                pfd.fd = backend_fd;
-                pfd.events = POLLIN;
-                pfd.revents = 0;
-                int ret = ::poll(&pfd, 1, timeout_ms);
-                if (ret > 0 && (pfd.revents & POLLIN)) {
-                    ssize_t n = ::recv(backend_fd, buf, max_len, MSG_DONTWAIT);
-                    return (n > 0) ? n : 0;
-                }
-                return 0;
+                ssize_t n = ::recv(backend_fd, buf, max_len, MSG_DONTWAIT);
+                return (n > 0) ? n : 0;
             }
 
             
@@ -406,6 +418,24 @@ namespace aethon {
                     start = (start + n) & 0xFFFF;
                     count -= n;
                 }
+            }
+
+            AETHON_ALWAYS_INLINE bool is_range_set(size_t start, size_t count) const noexcept {
+                if (!bitmap || count == 0) return false;
+                start &= 0xFFFF;
+                while (count > 0) {
+                    size_t word_idx = start >> 6;
+                    size_t bit_offset = start & 63;
+                    size_t bits_in_word = 64 - bit_offset;
+                    size_t n = (count < bits_in_word) ? count : bits_in_word;
+                    uint64_t mask = (n == 64) ? ~0ULL : ((1ULL << n) - 1ULL);
+                    if ((bitmap[word_idx] & (mask << bit_offset)) != 0) {
+                        return true;
+                    }
+                    start = (start + n) & 0xFFFF;
+                    count -= n;
+                }
+                return false;
             }
 
 
@@ -606,9 +636,10 @@ namespace aethon {
                 // RST --> connection killed by the sender
                 if(AETHON_UNLIKELY(flags & TH_RST)){
                     session->state = TcpState::CLOSED;
-                     result.is_closed = true;
+                    result.is_closed = true;
                     delete session;
                     sessions_.erase(key);
+                    result.session = nullptr;
                     return result;
                 }
 
@@ -676,6 +707,18 @@ namespace aethon {
                     }else if(TcpSeq::gt(cur_seq, session->rcv_nxt)){
 
                         if(AETHON_LIKELY(session->init_bufferes())){
+                            if (session->is_range_set(cur_seq, cur_len)) {
+                                uint8_t existing[1500];
+                                size_t check_len = (cur_len < sizeof(existing)) ? cur_len : sizeof(existing);
+                                session->read_ring_buffer(cur_seq, existing, check_len);
+                                if (std::memcmp(existing, cur_payload, check_len) != 0) {
+                                    result.is_closed = true;
+                                    delete session;
+                                    sessions_.erase(key);
+                                    result.session = nullptr;
+                                    return result;
+                                }
+                            }
                             session->write_ring_buffer(cur_seq, cur_payload, cur_len);
                             session->set_bitmap_range(cur_seq, cur_len);
                             session->out_of_order_count++;
@@ -685,6 +728,18 @@ namespace aethon {
                     // gap - filler packet (fills the missing hole at rcv_nxt)
                     else{
                         if(AETHON_LIKELY(session->init_bufferes())){
+                            if (session->is_range_set(cur_seq, cur_len)) {
+                                uint8_t existing[1500];
+                                size_t check_len = (cur_len < sizeof(existing)) ? cur_len : sizeof(existing);
+                                session->read_ring_buffer(cur_seq, existing, check_len);
+                                if (std::memcmp(existing, cur_payload, check_len) != 0) {
+                                    result.is_closed = true;
+                                    delete session;
+                                    sessions_.erase(key);
+                                    result.session = nullptr;
+                                    return result;
+                                }
+                            }
                             session->write_ring_buffer(cur_seq, cur_payload, cur_len);
                             session->set_bitmap_range(cur_seq, cur_len);
 
@@ -713,11 +768,14 @@ namespace aethon {
                 
 
                 if(AETHON_UNLIKELY(flags & TH_FIN)){
-                    session->rcv_nxt++; // FIN consume 1 sequence
+                    session->rcv_nxt++;
                     session->state = TcpState::CLOSING;
                     result.is_closed = true;
-                    delete session;
-                    sessions_.erase(key);
+                    if(result.payload_len == 0){
+                        delete session;
+                        sessions_.erase(key);
+                        result.session = nullptr;
+                    }
                 }
 
                 return result;

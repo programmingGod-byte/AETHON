@@ -42,13 +42,16 @@
     across two TCP segments is never matched. Overlapping segments also use a "last write
     wins" policy. These are the classic IPS evasions (Ptacek & Newsham). You need
     HS_MODE_STREAM with per-flow stream state.
+
   - Spoofing turns your defence into a weapon: any fragmented TCP packet permanently blocklists
     its source IP (xdp_kern_prog.c:284). An attacker can spoof a victim's IP to get them
     banned.
+
   - LockFreeHashMap isn't safe across threads: it publishes the key with a CAS before writing
     the value (fast_hash_map.h:101), so readers can see a half-written value. It can also
     insert duplicate keys through tombstones, and it assigns to a Value that has already been
     destroyed after erase.
+
   - The MPMC blockingWrite and blockingRead make a futex_wake syscall on every operation
     (mpmc_queue.h:79,129). That defeats the point of a lock-free queue.
   - Domain blocklist logic is inverted. rules/blocked_domains.txt is effectively used as an
@@ -56,6 +59,7 @@
     everything else is blocked. Your uncommitted change makes exact matches return blocked,
     which will break the TLS test for mydomain.com. Pick one meaning (block or allow) and
     rename the file.
+    
   - Blocking work on the packet path: poll(…, 50ms) to the backend, OpenSSL handshakes, and
     std::cout all run inside the RX worker. One slow backend stalls the whole queue.
   - Minor: maps are pinned only after the workers exit (afxdp_control.cpp:471), and

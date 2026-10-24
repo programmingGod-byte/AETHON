@@ -282,8 +282,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
             __u8 is_fragment_check = (frag_off_check & 0x3FFF) != 0 || (frag_off_check & 0x2000) != 0;
 
             if (is_fragment_check && iph_check->protocol == IPPROTO_TCP) {
-                __u64 flag = 1;
-                bpf_map_update_elem(&aethon_ip_blockist, &src_ip, &flag, BPF_ANY);
                 bpf_printk("TCP FRAGMENT ATTACK BLOCKED\n");
                 action = XDP_DROP;
                 goto out;
