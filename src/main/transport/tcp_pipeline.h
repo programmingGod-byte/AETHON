@@ -2,6 +2,7 @@
 
 #include "aethon/aethon.h"
 #include "af_xdp_header.h"
+#include <cstring>
 #include <liburing.h>
 #include <vector>
 #include <sys/epoll.h>
@@ -86,6 +87,20 @@ namespace pipeline {
 
         IPv4TcpAssembler::TcpAssemblyResult res = tcp_engine.process_packet(
             iph, tcph, payload, payload_len, now_ns);
+
+
+        
+        if(AETHON_UNLIKELY(res.is_syn && res.session)){
+            std::memcpy(res.session->client_mac,eth->ether_shost,6);
+            std::memcpy(res.session->server_mac, eth->ether_dhost, 6);
+
+            constexpr uint32_t initial_server_isn  = 1000000;
+            res.session->send_nxt = initial_server_isn + 1;
+            return net::PacketInjector::ipv4_send_tcp_syn_ack(
+                sock, buf_addr, pkt, eth, iph, tcph, initial_server_isn, ntohl(tcph->seq));
+        }
+    
+
 
         if (AETHON_LIKELY(res.is_ready && res.payload_len > 0)) {
             auto tls_info = tls::parse_client_hello(res.payload, res.payload_len);
