@@ -244,6 +244,7 @@ namespace aethon {
             size_t payload_len{0};
             TcpStreamSession *session{nullptr};
             hs_stream_t *hs_stream{nullptr};
+            bool fast_retransmit{false};
         };
 
         
@@ -284,7 +285,7 @@ namespace aethon {
             uint32_t rto_ms{200};                       // RTO in milliseconds (starts at 200ms)
             uint8_t retransmit_count{0};               // Number of retransmissions
 
-
+            uint8_t dup_ack_count{0};                      // Number of duplicate ACKs received
             // Compute dynamic receive window based on remaining buffer capacity
             AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
                 size_t used = backend_tx_buf.size();
@@ -770,7 +771,14 @@ namespace aethon {
                         // Successful ACK: reset RTO timer and retry counter
                         session->rto_ms = 200;
                         session->retransmit_count = 0;
+                        session->dup_ack_count = 0;
                         session->last_tx_time_ns = now_ns;
+                    } else if (ack_seq == session->snd_una && session->snd_una != session->send_nxt && payload_len == 0) {
+                        // RFC 5681: Fast Retransmit on 3 duplicate ACKs
+                        session->dup_ack_count++;
+                        if (session->dup_ack_count == 3) {
+                            result.fast_retransmit = true;
+                        }
                     }
                 }
 

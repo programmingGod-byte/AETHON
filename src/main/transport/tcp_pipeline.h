@@ -204,15 +204,15 @@ namespace pipeline {
         IPv4TcpAssembler::TcpAssemblyResult res = tcp_engine.process_packet(
             iph, tcph, payload, payload_len, now_ns);
 
+        if (AETHON_UNLIKELY(res.fast_retransmit && res.session)) {
+            retransmit_unacked_data(sock, res.session, tx_pool);
+        }
 
-        
         if(AETHON_UNLIKELY(res.is_syn && res.session)){
             std::memcpy(res.session->client_mac,eth->ether_shost,6);
             std::memcpy(res.session->server_mac, eth->ether_dhost, 6);
 
             constexpr uint32_t initial_server_isn  = 1000000;
-            res.session->send_nxt = initial_server_isn + 1;
-
             res.session->send_nxt = initial_server_isn + 1;
             res.session->snd_una = initial_server_isn + 1;
 
