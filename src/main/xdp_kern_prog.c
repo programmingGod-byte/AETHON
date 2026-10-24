@@ -229,7 +229,6 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         goto out;
     }
 
-    // 4. Rate Limiter Configuration & Lookup
     __u16 key_token = 1;
     __u16 key_window = 2;
     __u16 key_limit = 3;
