@@ -477,7 +477,26 @@ namespace pipeline {
             }
         }
 
-        if(AETHON_UNLIKELY(res.is_closed)){
+        if (AETHON_UNLIKELY(res.is_closed)) {
+            if (res.session) {
+                if (res.session->backend_fd >= 0) {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, res.session->backend_fd, nullptr);
+                    ::close(res.session->backend_fd);
+                    res.session->backend_fd = -1;
+                }
+
+                bool sent = net::PacketInjector::ipv4_send_tcp_fin(
+                    sock, buf_addr, pkt,
+                    eth->ether_shost, eth->ether_dhost,
+                    iph->saddr, iph->daddr,
+                    tcph->source, tcph->dest,
+                    res.session->send_nxt, res.session->rcv_nxt,
+                    res.session->recv_window());
+
+                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                return sent;
+            }
+
             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
         }
 

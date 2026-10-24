@@ -886,11 +886,6 @@ namespace aethon {
                     session->rcv_nxt++;
                     session->state = TcpState::CLOSING;
                     result.is_closed = true;
-                    if(result.payload_len == 0){
-                        delete session;
-                        sessions_.erase(key);
-                        result.session = nullptr;
-                    }
                 }
 
                 return result;
