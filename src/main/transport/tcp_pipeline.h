@@ -290,6 +290,13 @@ namespace pipeline {
         }
 
         if(AETHON_UNLIKELY(res.is_syn && res.session)){
+            // Issue #4: Guard against sending SYN-ACK on unmanaged ports (e.g. port 22 SSH)
+            uint16_t dport = ntohs(tcph->dest);
+            if (AETHON_UNLIKELY(!g_service_registry.is_managed_port(dport))) {
+                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                return false;
+            }
+
             std::memcpy(res.session->client_mac,eth->ether_shost,6);
             std::memcpy(res.session->server_mac, eth->ether_dhost, 6);
 

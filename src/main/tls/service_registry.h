@@ -101,6 +101,7 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
         using ServiceMap = aethon::SingleThreadHashMap<uint64_t, const ServiceConfig *,0>;
         ServiceMap domain_map_{MAX_SERVICES * 2};
         ServiceMap ip_port_map_{MAX_SERVICES * 2};
+        alignas(64) std::array<bool, 65536> managed_ports_{};
 
         AETHON_ALWAYS_INLINE static uint64_t hash_domain(std::string_view sv) noexcept {
             uint64_t hash = 14695981039346656037ULL;
@@ -144,6 +145,16 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
             uint64_t d_hash = hash_domain(domain);
             domain_map_.insert(d_hash, ptr);
 
+            // Ingress port: HTTPS defaults to 443, HTTP to 80, unless explicit in domain (e.g. domain.com:8443)
+            uint16_t listen_port = (cert != "none" && cert != "-" && key != "none" && key != "-") ? 443 : 80;
+            size_t colon = domain.find(':');
+            if (colon != std::string_view::npos) {
+                try {
+                    listen_port = static_cast<uint16_t>(std::stoi(std::string(domain.substr(colon + 1))));
+                } catch (...) {}
+            }
+            managed_ports_[listen_port] = true;
+
             return true;
         }
 
@@ -171,7 +182,22 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
             const ServiceConfig *ptr = &services_[idx];
             uint64_t key_val = make_ip_port_key(addr.s_addr, port);
             ip_port_map_.insert(key_val, ptr);
+            managed_ports_[port] = true;
             return true;
+        }
+
+        AETHON_ALWAYS_INLINE bool is_managed_port(uint16_t port) const noexcept {
+            return managed_ports_[port];
+        }
+
+        std::vector<uint16_t> get_listening_ports() const {
+            std::vector<uint16_t> ports;
+            for (size_t p = 1; p < 65536; ++p) {
+                if (managed_ports_[p]) {
+                    ports.push_back(static_cast<uint16_t>(p));
+                }
+            }
+            return ports;
         }
 
 

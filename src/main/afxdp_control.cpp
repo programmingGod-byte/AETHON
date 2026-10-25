@@ -536,6 +536,21 @@ int main(int argc, char **argv) {
   pin_xdp_map(engine, engine.find_map("aethon_rate_limiter"), "aethon_rate_limiter");
   pin_xdp_map(engine, engine.find_map("rate_limiter_params"), "rate_limiter_params");
 
+  // Issue #4: Pin and populate aethon_services_map with active ports from services.conf
+  struct bpf_map *services_map = engine.find_map("aethon_services_map");
+  if (services_map) {
+    pin_xdp_map(engine, services_map, "aethon_services_map");
+    int map_fd = bpf_map__fd(services_map);
+    if (map_fd >= 0) {
+      auto ports = aethon::pipeline::g_service_registry.get_listening_ports();
+      for (uint16_t port : ports) {
+        uint8_t val = 1;
+        bpf_map_update_elem(map_fd, &port, &val, BPF_ANY);
+        std::cout << "[Engine] Registered service port " << port << " in eBPF XDP filter\n";
+      }
+    }
+  }
+
   std::vector<std::thread> workers;
   
   workers.emplace_back(stats_printer);
