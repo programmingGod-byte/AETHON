@@ -13,6 +13,8 @@
 #include <sys/epoll.h>
 #include <thread>
 #include <vector>
+#include <filesystem>
+#include <array>
 #include <chrono>
 #include <atomic>
 #include <iomanip>
@@ -491,21 +493,49 @@ int main(int argc, char **argv) {
   // Discover and cache all local IPv4 addresses on this interface (AWS private IPs)
   aethon::Ipv4::load_interface_ips(ifname);
 
-  size_t total_rules = g_rule_db.load_from_file("rules/test_rules.rules");
-  if (total_rules == 0) {
-    total_rules = g_rule_db.load_from_file("../../rules/test_rules.rules");
+  // Rule sets: rules/rulesets.conf lists files and how matches are handled (block / policy / alert).
+  // Without it, fall back to the single local rule file where every match blocks.
+  const char *conf = std::filesystem::exists("rules/rulesets.conf") ? "rules/rulesets.conf"
+                   : std::filesystem::exists("../../rules/rulesets.conf") ? "../../rules/rulesets.conf" : nullptr;
+  if (conf) {
+    std::cout << "Loading rule sets from " << conf << ":\n";
+    auto st = g_rule_db.load_rulesets(conf);
+    std::cout << "Rules: parsed " << st.parsed << ", loaded " << st.loaded << " (" << st.blocking
+              << " blocking), skipped " << st.skipped_outbound << " outbound/response, "
+              << st.skipped_unsupported << " with unsupported conditions, " << st.skipped_protocol
+              << " non-TCP\n";
+  } else {
+    size_t total_rules = g_rule_db.load_from_file("rules/test_rules.rules");
+    if (total_rules == 0) {
+      total_rules = g_rule_db.load_from_file("../../rules/test_rules.rules");
+    }
+    std::cout << "Loaded " << total_rules << " Snort/Suricata rules from test_rules.rules.\n";
   }
-  std::cout << "Loaded " << total_rules << " Snort/Suricata rules from test_rules.rules.\n";
   if (!g_rule_db.empty()) {
     g_master_scanner.set_alert_callback([](const aethon::scan::AttackAlert &alert) {
-      std::cout << "\n[ALERT] Threat Detected! SID: " << alert.sid;
+      // Print the first few hits per SID only: informational rules can fire on every request,
+      // and printing runs on the packet thread
+      static std::array<std::atomic<uint32_t>, 4096> seen{};
+      const uint32_t n = seen[alert.sid % seen.size()].fetch_add(1, std::memory_order_relaxed);
+      if (n >= 3) return;
+      std::cout << "\n[" << (alert.blocking ? "ALERT" : "LOG") << "] SID: " << alert.sid;
       if (alert.rule) {
         std::cout << " | Msg: " << alert.rule->msg;
       }
+      if (n == 2) std::cout << " (further hits of this SID not printed)";
       std::cout << std::endl;
     });
-    g_master_scanner.compile_rules(g_rule_db);
-    std::cout << "Compiled " << g_master_scanner.rule_count() << " rules into master Hyperscan database.\n";
+    aethon::scan::CompileStats cs;
+    const char *cache_dir = std::filesystem::exists("rules") ? "rules/.hs_cache" : "../../rules/.hs_cache";
+    if (g_master_scanner.compile_or_load(g_rule_db, cache_dir, cs)) {
+      std::cout << "Hyperscan: " << (cs.from_cache ? "loaded " : "compiled ") << cs.compiled
+                << " patterns (" << cs.blocking << " blocking) in " << static_cast<int>(cs.compile_ms)
+                << " ms" << (cs.from_cache ? " from cache" : "") << "; skipped " << cs.skipped_invalid
+                << " unsupported regex, " << cs.skipped_weak << " too short; database "
+                << cs.database_bytes / 1024 << " KB, stream state " << cs.stream_state_bytes << " B/connection\n";
+    } else {
+      std::cerr << "Hyperscan: compile FAILED, deep packet inspection is disabled\n";
+    }
   }
 
 
