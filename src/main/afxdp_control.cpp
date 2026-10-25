@@ -424,6 +424,18 @@ inline void stats_printer() {
 
     last_packets = current_packets;
     last_bytes = current_bytes;
+
+    // Every 5 s, if any reset/drop counter changed, print them on their own line
+    static uint64_t tick = 0, last_events = 0;
+    if (++tick % 5 == 0) {
+      uint64_t events = aethon::stats::total();
+      if (events != last_events) {
+        std::cout << std::endl;
+        aethon::stats::print_nonzero(stdout, "[Events]");
+        std::fflush(stdout);
+        last_events = events;
+      }
+    }
   }
 }
 
@@ -562,6 +574,9 @@ int main(int argc, char **argv) {
   for (auto &w : workers) {
     w.join();
   }
-  std::cout << "\n[Engine] Gracefully stopped all workers.\n";
+  std::cout << "\n[Engine] Gracefully stopped all workers.\n" << std::flush;
+  if (!aethon::stats::print_nonzero(stdout, "[Events] totals:")) {
+    std::cout << "[Events] totals: none\n";
+  }
   return 0;
 }

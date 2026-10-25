@@ -17,6 +17,8 @@
 #endif
 
 #include "tcp_assembler.h"
+#include "ip_address.h"
+#include "event_counters.h"
 #include "hyper_scan_engine.h"
 #include "packet_injector.h"
 #include <cstddef>
@@ -370,8 +372,24 @@ namespace pipeline {
         const uint16_t payload_len = total_ip_len - ip_hdr_len - tcp_hdr_len;
         const uint8_t * __restrict__ payload = reinterpret_cast<const uint8_t *>(tcph) + tcp_hdr_len;
 
+        // Drop corrupted segments like the kernel does; the sender retransmits. Without this a
+        // flipped flag (e.g. RST), port or sequence number would be acted upon.
+        if (AETHON_UNLIKELY(!Ipv4::is_valid_tcp_checksum(
+                iph, reinterpret_cast<const uint8_t *>(tcph), total_ip_len - ip_hdr_len))) {
+            stats::count(stats::Event::TcpBadChecksum);
+            return false;
+        }
+
         IPv4TcpAssembler::TcpAssemblyResult res = tcp_engine.process_packet(
             iph, tcph, payload, payload_len, now_ns);
+
+        if (AETHON_UNLIKELY(res.syn_cookie)) {
+            if (!g_service_registry.is_managed_port(ntohs(tcph->dest))) {
+                return false;
+            }
+            return net::PacketInjector::ipv4_send_tcp_syn_ack(
+                sock, buf_addr, pkt, eth, iph, tcph, res.syn_cookie_isn, ntohl(tcph->seq));
+        }
 
         if (AETHON_UNLIKELY(!res.session)) {
             uint8_t flags = reinterpret_cast<const uint8_t *>(tcph)[13];
@@ -385,8 +403,14 @@ namespace pipeline {
                 return net::PacketInjector::ipv4_send_tcp_ack(
                     sock, buf_addr, pkt, eth, iph, tcph, ntohl(tcph->ack_seq), ntohl(tcph->seq) + payload_len + 1, 0);
             }
+            stats::count(res.overlap_violation ? stats::Event::RstOverlapEvasion : stats::Event::RstNoSession);
             return net::PacketInjector::ipv4_send_tcp_rst(
                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+        }
+
+        if (AETHON_UNLIKELY(res.from_cookie)) {
+            std::memcpy(res.session->client_mac, eth->ether_shost, 6);
+            std::memcpy(res.session->server_mac, eth->ether_dhost, 6);
         }
 
         if (AETHON_UNLIKELY(res.fast_retransmit && res.session)) {
@@ -476,14 +500,20 @@ namespace pipeline {
 
             // Handle multi-segment ClientHello (e.g., Chrome with post-quantum keys > 1460 bytes MTU)
             if(res.session && res.session->tls_conn.status() == tls::TlsSessionStatus::IDLE){
+                // A ClientHello can only start at the very first byte of the stream. Plain sessions
+                // stay IDLE forever, so without this check any upload segment that happened to start
+                // with 0x16 ... 0x01 (about 1 in 65536) was parsed as TLS and usually reset.
+                const bool stream_start = !res.session->app_data_seen;
+                res.session->app_data_seen = true;
                 // Check if an accumulation is already in progress or if this packet starts a TLS ClientHello
-                if (!res.session->client_hello_buf.empty() || 
-                    (res.payload_len >= 6 && res.payload[0] == 0x16 && res.payload[5] == 0x01)) {
+                if (!res.session->client_hello_buf.empty() ||
+                    (stream_start && res.payload_len >= 6 && res.payload[0] == 0x16 && res.payload[5] == 0x01)) {
 
                     // Reject connections exceeding maximum allowable TLS record size
                     if (AETHON_UNLIKELY(res.session->client_hello_buf.size() + res.payload_len > MAX_CLIENT_HELLO)) {
                         res.session->client_hello_buf.clear();
                         tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                        stats::count(stats::Event::RstBadClientHello);
                         return net::PacketInjector::ipv4_send_tcp_rst(
                             sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                     }
@@ -500,6 +530,7 @@ namespace pipeline {
                             // Malformed TLS record length exceeding RFC limit; abort connection
                             res.session->client_hello_buf.clear();
                             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            stats::count(stats::Event::RstBadClientHello);
                             return net::PacketInjector::ipv4_send_tcp_rst(
                                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                         }
@@ -575,6 +606,7 @@ namespace pipeline {
                         res.session->client_hello_buf.clear();
                     }
                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    stats::count(stats::Event::RstSniBlocked);
                     return net::PacketInjector::ipv4_send_tcp_rst(
                         sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                 }
@@ -641,6 +673,7 @@ namespace pipeline {
                             std::cout << ":" << ntohs(tcph->dest) << std::endl;
 
                             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            stats::count(stats::Event::RstDpiMatch);
                             return net::PacketInjector::ipv4_send_tcp_rst(
                                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                         }else{
@@ -654,6 +687,7 @@ namespace pipeline {
                                 //  Protect against unbounded memory growth in backend_tx_buf (CWE-400 / CWE-770)
                                 if (AETHON_UNLIKELY(!res.session->forward_to_backend(plain_buf, plain_len, target_port))) {
                                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                                    stats::count(stats::Event::RstBackendFailed);
                                     return net::PacketInjector::ipv4_send_tcp_rst(
                                         sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                                 }
@@ -684,6 +718,7 @@ namespace pipeline {
                     if (AETHON_UNLIKELY(res.session->tls_conn.status() == tls::TlsSessionStatus::ERROR_STATE)) {
                         // Undecryptable stream (bad MAC, protocol error): abort instead of stalling
                         tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                        stats::count(stats::Event::RstTlsError);
                         return net::PacketInjector::ipv4_send_tcp_rst(
                             sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                     }
@@ -714,6 +749,7 @@ namespace pipeline {
                         res.session->client_hello_buf.clear();
                     }
                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    stats::count(stats::Event::RstDpiMatch);
                     return net::PacketInjector::ipv4_send_tcp_rst(
                         sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                 }else{
@@ -729,6 +765,7 @@ namespace pipeline {
                         if (AETHON_UNLIKELY(!res.session->forward_to_backend(hello_data, hello_len, target_port))) {
                             res.session->client_hello_buf.clear();
                             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            stats::count(stats::Event::RstBackendFailed);
                             return net::PacketInjector::ipv4_send_tcp_rst(
                                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                         }
@@ -813,6 +850,7 @@ namespace pipeline {
                     uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
                     if (now_ns - session->last_tx_time_ns > rto_ns) {
                         if (session->retransmit_count >= MAX_TCP_RETRIES) {
+                            stats::count(stats::Event::SessionRtoGiveUp);
                             // Max retries exceeded: remote client is dead, close session
                             tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                         } else {
@@ -829,6 +867,7 @@ namespace pipeline {
                     uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
                     if (now_ns - session->last_tx_time_ns > rto_ns) {
                         if (session->retransmit_count >= MAX_TCP_RETRIES) {
+                            stats::count(stats::Event::SessionRtoGiveUp);
                             // Max retries exceeded: client is dead, close session
                             tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                         } else if (!tx_pool.empty()) {

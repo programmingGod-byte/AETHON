@@ -214,7 +214,7 @@ if want attacks; then
     done
     wait
     [[ $ok -eq $total ]] && pass "real client unaffected by SYN flood ($ok/$total)" \
-      || fail "real client failed during SYN flood ($ok/$total ok); expected until SYN cookies exist"
+      || fail "real client failed during SYN flood ($ok/$total ok); check syn_cookie_* in Aethon's [Events] line"
     sleep 4   # half-open sessions expire after 3 s
   fi
   alive_check

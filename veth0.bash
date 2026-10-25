@@ -36,6 +36,14 @@ sudo ip netns exec client_ns ip link set lo up
 sudo ip netns exec client_ns ip link set veth1 up
 sudo ip netns exec client_ns ip addr add 192.168.50.2/24 dev veth1
 
+echo "⚙️ 7. Disabling offloads and TX re-hashing..."
+# TSO/GSO/GRO build frames larger than a 2 KB UMEM frame, and TX checksum offload leaves
+# partial TCP checksums that Aethon (which verifies checksums) would reject.
+sudo ethtool -K veth0 gro off gso off tso off tx off >/dev/null 2>&1
+sudo ip netns exec client_ns ethtool -K veth1 gro off gso off tso off tx off >/dev/null 2>&1
+# veth maps the client's TX queue to the RX queue; keep each flow on one queue like NIC RSS does
+sudo ip netns exec client_ns sysctl -qw net.core.txrehash=0
+
 echo "✅ Network is ready! veth0 (192.168.50.1) <---> veth1 (192.168.50.2) [4 Queues Active]"
 
 

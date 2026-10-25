@@ -67,6 +67,8 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 #include <vector>
 #include "aethon/aethon.h"
 #include "tcp_congestion.h"
+#include "event_counters.h"
+#include <random>
 
 #ifndef AETHON_ALWAYS_INLINE
 #if defined(__GNUC__) || defined(__clang__)
@@ -229,8 +231,13 @@ namespace aethon {
         static constexpr size_t AETHON_MAX_ACTIVE_TCP_SESSION = 65536;
         static constexpr size_t AETHON_TCP_WINDOW_SIZE = 65536;
         static constexpr size_t AETHON_TCP_BITMAP_WORDS        = AETHON_TCP_WINDOW_SIZE / 64; 
-        static constexpr uint64_t AETHON_TCP_SYN_TIMEOUT_NS    = 3ULL * 1000000000ULL;  
-        static constexpr uint64_t AETHON_TCP_ESTAB_TIMEOUT_NS  = 30ULL * 1000000000ULL; 
+        static constexpr uint64_t AETHON_TCP_SYN_TIMEOUT_NS    = 3ULL * 1000000000ULL;
+        // Longer than common backend keep-alive timeouts (nginx: 65 s), so idle keep-alive
+        // connections are closed cleanly by the backend (FIN) before Aethon forgets them.
+        static constexpr uint64_t AETHON_TCP_ESTAB_TIMEOUT_NS  = 120ULL * 1000000000ULL;
+        // Above this many sessions per worker, new SYNs are answered with SYN cookies
+        // (no state until the client completes the handshake).
+        static constexpr size_t AETHON_SYNCOOKIE_THRESHOLD = AETHON_MAX_ACTIVE_TCP_SESSION / 4;
 
 
         struct TcpStreamSession;
@@ -247,6 +254,10 @@ namespace aethon {
             TcpStreamSession *session{nullptr};
             hs_stream_t *hs_stream{nullptr};
             bool fast_retransmit{false};
+            bool syn_cookie{false};          // answer this SYN statelessly with ISN = syn_cookie_isn
+            uint32_t syn_cookie_isn{0};
+            bool from_cookie{false};         // session was just created from a valid SYN cookie
+            bool overlap_violation{false};   // session killed: retransmission contradicts buffered data
         };
 
         
@@ -343,6 +354,7 @@ namespace aethon {
             uint32_t send_nxt{0};
 
             std::vector<uint8_t> client_hello_buf;
+            bool app_data_seen{false};      // first in-order payload byte already processed
 
             TcpStreamSession() = default;
 
@@ -633,8 +645,66 @@ namespace aethon {
 
                  uint64_t last_cleanup_ns_{0};
 
+                 // SYN cookie secret (per worker; a flow always returns to the same worker)
+                 uint64_t cookie_k0_{0};
+                 uint64_t cookie_k1_{0};
+                 static constexpr uint64_t kCookieSlotNs = 64ULL * 1000000000ULL;   // 64 s time slots
+
+                 static AETHON_ALWAYS_INLINE uint64_t rotl(uint64_t x, int b) noexcept {
+                     return (x << b) | (x >> (64 - b));
+                 }
+
+                 // SipHash-2-4 of three 64-bit words (24 bytes)
+                 AETHON_ALWAYS_INLINE uint64_t siphash3(uint64_t m0, uint64_t m1, uint64_t m2) const noexcept {
+                     uint64_t v0 = 0x736f6d6570736575ULL ^ cookie_k0_;
+                     uint64_t v1 = 0x646f72616e646f6dULL ^ cookie_k1_;
+                     uint64_t v2 = 0x6c7967656e657261ULL ^ cookie_k0_;
+                     uint64_t v3 = 0x7465646279746573ULL ^ cookie_k1_;
+                     auto round = [&]() noexcept {
+                         v0 += v1; v1 = rotl(v1, 13); v1 ^= v0; v0 = rotl(v0, 32);
+                         v2 += v3; v3 = rotl(v3, 16); v3 ^= v2;
+                         v0 += v3; v3 = rotl(v3, 21); v3 ^= v0;
+                         v2 += v1; v1 = rotl(v1, 17); v1 ^= v2; v2 = rotl(v2, 32);
+                     };
+                     for (uint64_t m : {m0, m1, m2}) {
+                         v3 ^= m; round(); round(); v0 ^= m;
+                     }
+                     const uint64_t last = 24ULL << 56;          // message length in the final block
+                     v3 ^= last; round(); round(); v0 ^= last;
+                     v2 ^= 0xff;
+                     round(); round(); round(); round();
+                     return v0 ^ v1 ^ v2 ^ v3;
+                 }
+
+                 AETHON_ALWAYS_INLINE uint32_t cookie_mac(const TcpKey &k, uint32_t client_isn, uint32_t slot) const noexcept {
+                     const uint64_t m0 = static_cast<uint64_t>(k.src_ip) | (static_cast<uint64_t>(k.dst_ip) << 32);
+                     const uint64_t m1 = static_cast<uint64_t>(k.src_port) | (static_cast<uint64_t>(k.dst_port) << 16) |
+                                         (static_cast<uint64_t>(client_isn) << 32);
+                     return static_cast<uint32_t>(siphash3(m0, m1, slot)) & 0x07FFFFFFu;
+                 }
+
             public:
-                TcpAssemblerEngine () = default;
+                TcpAssemblerEngine() {
+                    std::random_device rd;
+                    cookie_k0_ = (static_cast<uint64_t>(rd()) << 32) | rd();
+                    cookie_k1_ = (static_cast<uint64_t>(rd()) << 32) | rd();
+                }
+
+                // Cookie layout: [5 bits time slot][27 bits SipHash MAC of 4-tuple + client ISN + slot]
+                AETHON_ALWAYS_INLINE uint32_t make_syn_cookie(const TcpKey &k, uint32_t client_isn, uint64_t now_ns) const noexcept {
+                    const uint32_t slot = static_cast<uint32_t>(now_ns / kCookieSlotNs) & 0x1F;
+                    return (slot << 27) | cookie_mac(k, client_isn, slot);
+                }
+
+                // Valid for the current and the previous slot (64-128 s)
+                AETHON_ALWAYS_INLINE bool check_syn_cookie(const TcpKey &k, uint32_t client_isn, uint32_t cookie, uint64_t now_ns) const noexcept {
+                    const uint32_t slot = cookie >> 27;
+                    const uint32_t now_slot = static_cast<uint32_t>(now_ns / kCookieSlotNs) & 0x1F;
+                    if (((now_slot - slot) & 0x1F) > 1) return false;
+                    return (cookie & 0x07FFFFFFu) == cookie_mac(k, client_isn, slot);
+                }
+
+                size_t session_count() const noexcept { return sessions_.size(); }
 
                 ~TcpAssemblerEngine(){
 
@@ -676,6 +746,9 @@ namespace aethon {
                                                   ? (age > AETHON_TCP_SYN_TIMEOUT_NS)
                                                   : (age > AETHON_TCP_ESTAB_TIMEOUT_NS);
                             if (AETHON_UNLIKELY(is_expired)) {
+                                if (session->state != TcpState::SYN_SENT) {
+                                    stats::count(stats::Event::SessionExpiredIdle);
+                                }
                                 TcpKey stale_key = cell->key;
                                 delete session;
                                 sessions_.erase(stale_key);
@@ -737,10 +810,6 @@ namespace aethon {
                 const uint8_t flags = reinterpret_cast<const uint8_t *>(tcph)[13];
                 const uint32_t seq   = ntohl(tcph->seq);
 
-                if (AETHON_UNLIKELY((flags & TH_SYN) && !(flags & TH_ACK) && sessions_.size() >= AETHON_MAX_ACTIVE_TCP_SESSION)) {
-                    return result;
-                }
-
                 TcpStreamSession **slot = sessions_.find(key);
                 TcpStreamSession *session = nullptr;
 
@@ -748,15 +817,40 @@ namespace aethon {
                     session = *slot;
                     AETHON_BUILTIN_PREFETCH(session, 1, 3);
                     result.session = session;
-                }else{
-                    // if NON SYN Packet DROP
-                    if(AETHON_UNLIKELY(!(flags & TH_SYN))){
+                }else if(AETHON_UNLIKELY(!(flags & TH_SYN))){
+                    // No session: only a handshake ACK (or first data) carrying a valid SYN cookie may create one
+                    if ((flags & TH_ACK) && !(flags & (TH_RST | TH_FIN)) &&
+                        sessions_.size() < AETHON_MAX_ACTIVE_TCP_SESSION) {
+                        const uint32_t ack = ntohl(tcph->ack_seq);
+                        if (check_syn_cookie(key, seq - 1, ack - 1, now_ns)) {
+                            session = new (std::nothrow) TcpStreamSession();
+                            if (AETHON_UNLIKELY(!session)) {
+                                return result;
+                            }
+                            session->key = key;
+                            session->isn = seq - 1;
+                            session->rcv_nxt = seq;
+                            session->server_isn = ack - 1;
+                            session->send_nxt = ack;
+                            session->snd_una = ack;
+                            session->state = TcpState::ESTABLISHED;
+                            session->last_seen_ns = now_ns;
+                            sessions_.insert(key, session);
+                            result.session = session;
+                            result.from_cookie = true;
+                            stats::count(stats::Event::SynCookieAccepted);
+                            // fall through: this segment's ACK and payload are processed normally below
+                        }
+                    }
+                    if (!session) {
                         return result;
                     }
-
-                    // table capacity defence
-
-                    if(AETHON_UNLIKELY(sessions_.size() >= AETHON_MAX_ACTIVE_TCP_SESSION)){
+                }else{
+                    // Table under pressure (e.g. SYN flood): answer statelessly, allocate nothing
+                    if(AETHON_UNLIKELY(sessions_.size() >= AETHON_SYNCOOKIE_THRESHOLD)){
+                        result.syn_cookie = true;
+                        result.syn_cookie_isn = make_syn_cookie(key, seq, now_ns);
+                        stats::count(stats::Event::SynCookieSent);
                         return result;
                     }
 
@@ -911,6 +1005,7 @@ namespace aethon {
                         if(AETHON_LIKELY(session->init_bufferes())){
                             if (session->conflicts_with_buffered(cur_seq, cur_payload, cur_len)) {
                                 result.is_closed = true;
+                                result.overlap_violation = true;
                                 delete session;
                                 sessions_.erase(key);
                                 result.session = nullptr;
@@ -928,6 +1023,7 @@ namespace aethon {
                         if(AETHON_LIKELY(session->init_bufferes())){
                             if (session->conflicts_with_buffered(cur_seq, cur_payload, cur_len)) {
                                 result.is_closed = true;
+                                result.overlap_violation = true;
                                 delete session;
                                 sessions_.erase(key);
                                 result.session = nullptr;

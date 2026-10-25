@@ -101,5 +101,53 @@ AETHON_ALWAYS_INLINE bool is_valid_ipv4_checksum(const struct iphdr *__restrict_
   // A valid checksum sums to 0xFFFF in one's complement (or ~acc == 0)
   return static_cast<uint16_t>(acc) == 0xFFFF;
 }
+
+// Verifies the TCP checksum over the pseudo-header and the whole segment (header + payload).
+// Words are summed in memory order, so the result is endian-independent (RFC 1071).
+// Requires full checksums on the wire: receive-side offloads that leave partial checksums
+// (e.g. veth with TX checksum offload on the peer) must be disabled.
+AETHON_ALWAYS_INLINE bool is_valid_tcp_checksum(const struct iphdr *__restrict__ iph,
+                                                const uint8_t *__restrict__ segment,
+                                                size_t segment_len) noexcept {
+  uint64_t acc = static_cast<uint64_t>(iph->saddr) + iph->daddr +
+                 htons(static_cast<uint16_t>(IPPROTO_TCP)) +
+                 htons(static_cast<uint16_t>(segment_len));
+
+  const uint8_t *__restrict__ p = segment;
+  size_t n = segment_len;
+  while (n >= 8) {
+    uint64_t w;
+    std::memcpy(&w, p, 8);
+    acc += (w & 0xFFFFFFFF) + (w >> 32);
+    p += 8;
+    n -= 8;
+  }
+  if (n >= 4) {
+    uint32_t w;
+    std::memcpy(&w, p, 4);
+    acc += w;
+    p += 4;
+    n -= 4;
+  }
+  if (n >= 2) {
+    uint16_t w;
+    std::memcpy(&w, p, 2);
+    acc += w;
+    p += 2;
+    n -= 2;
+  }
+  if (n) {
+    uint16_t w = 0;            // odd trailing byte, padded with a zero byte
+    std::memcpy(&w, p, 1);
+    acc += w;
+  }
+
+  acc = (acc & 0xFFFFFFFF) + (acc >> 32);
+  acc = (acc & 0xFFFFFFFF) + (acc >> 32);
+  acc = (acc & 0xFFFF) + (acc >> 16);
+  acc = (acc & 0xFFFF) + (acc >> 16);
+  acc = (acc & 0xFFFF) + (acc >> 16);
+  return static_cast<uint16_t>(acc) == 0xFFFF;
+}
 }; // namespace Ipv4
 }; // namespace aethon
