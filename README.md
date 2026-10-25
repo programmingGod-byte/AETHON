@@ -1,232 +1,249 @@
-# High-Performance AF_XDP Security Pipeline
+# Aethon
 
-This project implements a high-performance network security engine leveraging Linux **eBPF/XDP (eXpress Data Path)** and **AF_XDP Zero-Copy sockets**. It is designed to operate as a low-latency **DDoS Mitigator**, **Load Balancer**, and **Intrusion Prevention System (IPS)**.
+**An inline intrusion prevention system and TLS-terminating reverse proxy built on eBPF/XDP and AF_XDP, with its own userspace TCP stack.**
 
----
+Aethon sits in front of your web services on a single Linux host. XDP steers traffic for the ports you protect into userspace through AF_XDP sockets; everything else (SSH, DNS, IPv6, UDP) goes straight to the kernel untouched. In userspace, Aethon terminates TCP and TLS itself, inspects the plaintext with Hyperscan in streaming mode, enforces SNI and JA3 policy, and proxies clean traffic to your backends on loopback.
 
-### 🏗️ System Architecture (Dual-Plane Design)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue) ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey) ![eBPF/XDP](https://img.shields.io/badge/eBPF-XDP%20%2B%20AF__XDP-orange) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-To process packets at line rate without degrading system performance, Aethon XDP-Sentinel splits responsibilities into a **Data Plane** (Kernel eBPF) and an **Analytics/Control Plane** (User-space C++), connected via highly optimized BPF Maps and AF_XDP Zero-Copy rings.
-
-```text
-                     [ Incoming Traffic ]
-                              │
-  ┌───────────────────────────┴───────────────────────────┐
-  │  DATA PLANE: XDP Kernel space (af_xdp_kern.c)         │
-  │  - Parses Eth/IP/TCP headers using pointer arithmetic │
-  │  - Checks `ip_blocklist` BPF map (O(1) lookup)        │
-  │  - Applies Token Bucket rate limiting via BPF maps    │
-  │  - Drops Malicious Packets instantly (XDP_DROP)       │
-  │  - Redirects suspicious/HTTP traffic to User-space    │
-  └───────────────────────────┬───────────────────────────┘
-                              ▼ (AF_XDP RX Ring - Zero Copy DMA)
-  ┌───────────────────────────┴───────────────────────────┐
-  │  ANALYTICS PLANE: User-space C++ (af_xdp_user.c)      │
-  │  - Receives packets via AF_XDP into UMEM              │
-  │  - EWMA Spike Detection for sudden traffic bursts     │
-  │  - SIMD (AVX2) Payload Parsing & Signature Matching   │
-  │  - Updates `ip_blocklist` Map for closed-loop block   │
-  │  - io_uring for async, zero-syscall disk logging      │
-  └───────────────────────────┬───────────────────────────┘
-```
-
-### 🧠 How It's Implemented: Component Breakdown
-
-#### 1. eBPF / XDP Data Plane (`af_xdp_kern.c`)
-- **Execution:** Runs directly in the NIC driver. Executes in nanoseconds.
-- **BPF Maps:**
-  - `ip_blocklist` (`BPF_MAP_TYPE_HASH`): Maps Source IP to an expiration timestamp. If XDP sees an IP in this map, it instantly returns `XDP_DROP`.
-  - `ip_counters` (`BPF_MAP_TYPE_PERCPU_HASH`): Stores `packet_count` and `last_updated`. Used to track traffic rates per IP.
-  - `admin_config` (`BPF_MAP_TYPE_ARRAY`): Allows the user-space administrator to dynamically adjust the global rate limit (e.g., 60 packets/sec).
-- **Rate Limiting:** Implements a Token Bucket algorithm inside the kernel. If an IP exceeds the token limit within a timeframe, packets are dropped.
-
-#### 2. AF_XDP Zero-Copy Pipeline
-- Instead of using standard Linux sockets (which require memory copies and context switches), unhandled or suspicious packets are sent directly to user-space memory (UMEM) via **AF_XDP**.
-- The `AF_XDP` sockets use lock-free rings (RX, TX, FILL, COMPLETION) to pass packet offsets between the kernel and the C++ application.
-
-#### 3. Spike Detection via EWMA (User-space Analytics, `af_xdp_user.c`)
-- The C++ analytics engine computes an **Exponentially Weighted Moving Average (EWMA)** of traffic per IP using fast bitwise shifts instead of floating-point math:
-  `old_ewma = old_ewma - (old_ewma >> 3) + (current_rate >> 3);`
-- If the `current_rate` suddenly spikes beyond the EWMA (e.g., a 3x multiplier), the engine flags the IP as anomalous and dynamically writes it into the `ip_blocklist` BPF Map. The next packet from that IP is instantly dropped by the kernel.
-
-#### 4. SIMD (AVX2) Deep Packet Inspection (`af_xdp_user.c`)
-- For HTTP/DNS traffic, the payload must be inspected for signatures (like SQL injection `1=1` or XSS scripts).
-- Standard string searching is too slow for 10Gbps+ networks.
-- Aethon utilizes **AVX2 SIMD Intrinsics** (`_mm256_cmpeq_epi8`, `_mm256_movemask_epi8`) to search 32 bytes of payload simultaneously in a single CPU cycle. It flattens Aho-Corasick automata into SIMD-friendly vector operations.
-
-#### 5. io_uring Asynchronous Logging
-- Every dropped packet or blocked IP must be logged for auditing.
-- Standard file I/O (`write()`) involves expensive syscalls and thread blocking.
-- Aethon uses **`io_uring` in SQPOLL (Zero-Syscall) mode** to asynchronously flush logs to disk. The C++ app enqueues log entries into a lock-free submission queue, and a kernel thread writes them to disk in the background, achieving millions of log events per second with zero application overhead.
-
-#### 6. Lock-Free Concurrency (`aethon::MpmcQueue`, `aethon::SpscQueue`)
-- To scale across multiple CPU cores, the system distributes packet processing tasks among worker threads.
-- Instead of standard mutexes (which cause context-switch latency), thread communication relies on **Aethon's Lock-Free queues**. Bounded queues use atomic compare-and-swap (CAS) and memory barriers (`std::memory_order_release` / `acquire`) to achieve sub-20-nanosecond inter-thread latencies.
+> **Status:** research / portfolio project under active development. It passes an end-to-end test suite with real clients (curl, wrk, browsers) through nginx and Node.js, including transfers under packet loss, but it has not been hardened for production. See [Known limitations](#known-limitations).
 
 ---
 
-## 🗄️ Attack Signature Resources
-
-To populate your pattern search trees (e.g. Aho-Corasick or string match engines) with realistic signatures for HTTP, DNS, ICMP, and ARP, use the following open-source databases:
-
-### **1. HTTP & Web Attacks (WAF)**
-
-- **Database:** [OWASP ModSecurity Core Rule Set (CRS)](https://github.com/coreruleset/coreruleset)
-- **Description:** The industry standard for web application protection.
-- **Target Files (in the `rules/` directory):**
-  - `REQUEST-942-APPLICATION-ATTACK-SQLI.conf` (SQL Injection regex)
-  - `REQUEST-941-APPLICATION-ATTACK-XSS.conf` (Cross-Site Scripting signatures)
-  - `REQUEST-932-APPLICATION-ATTACK-RCE.conf` (Remote Code Execution commands)
-
-### **2. Network Protocols (DNS, ICMP, ARP, TCP)**
-
-- **Database:** [Emerging Threats (ET) Open Rules](https://rules.emergingthreats.net/open/)
-- **Description:** Community-maintained rules for Suricata and Snort.
-- **Target Files (in the `rules/` directory):**
-  - `emerging-dns.rules` (DNS Tunneling patterns, malformed queries, cache poisoning)
-  - `emerging-icmp.rules` (Ping of Death, ICMP redirect payloads)
-  - `emerging-malware.rules` (Active command & control payloads)
-
-### **3. Raw Exploit Payloads (Testing)**
-
-- **Database:** [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings)
-- **Description:** A comprehensive repository of raw security bypass payloads.
-- **Target Folders:**
-  - `SQL Injection/` (Flat lists of SQL evasion bypass strings)
-  - `XSS/` (Lists of obfuscated JavaScript payloads)
+## Contents
+- [Why](#why)
+- [Architecture](#architecture)
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Testing](#testing)
+- [Measured results](#measured-results)
+- [Known limitations](#known-limitations)
+- [Project layout](#project-layout)
+- [Roadmap](#roadmap)
+- [Contributing, security and conduct](#contributing-security-and-conduct)
+- [References](#references)
+- [License](#license)
 
 ---
 
-## 🛠️ Build and Run AF_XDP Pipeline
+## Why
 
-### **Prerequisites**
+A classic single-server setup for inspecting web traffic is several separate systems: the kernel TCP stack, an IDS such as Suricata (often copying every packet to userspace through NFQUEUE), a TLS terminator, and a WAF in the web server. Aethon explores doing this in **one process on the packet path**:
 
-Install the eBPF development libraries:
+- **Early drops in the driver:** XDP can discard unwanted traffic before the kernel allocates anything for it.
+- **Kernel bypass for protected ports:** packets arrive in userspace through shared-memory rings, without a syscall or an `sk_buff` per packet.
+- **Inspection of encrypted traffic:** Aethon terminates TLS, so rules run on the decrypted HTTP payload, across packet and TLS-record boundaries.
+- **Full control on a small VPS:** one binary, plain-text config files, no cluster.
+
+## Architecture
+
+```
+                         Internet / client
+                                │
+                        NIC driver (eth0 / veth0)
+                                │
+  ┌─────────────────────────────▼─────────────────────────────────────┐
+  │ XDP program (src/main/ebpf/xdp_kern_prog.c)                        │
+  │  • TCP to a managed port (aethon_services_map) → AF_XDP socket     │
+  │  • TCP fragments → XDP_DROP                                        │
+  │  • everything else (SSH, DNS, UDP, IPv6, ARP) → XDP_PASS → kernel  │
+  └─────────────────────────────┬─────────────────────────────────────┘
+                                │ AF_XDP RX ring (UMEM, one socket per queue)
+  ┌─────────────────────────────▼─────────────────────────────────────┐
+  │ Userspace engine (src/main/afxdp_control.cpp), one pinned worker   │
+  │ per NIC queue, each with its own session table                     │
+  │                                                                    │
+  │  IPv4 validation → TCP state machine (transport/)                  │
+  │     handshake · reassembly · overlap-evasion check · flow control  │
+  │     RFC 6298 RTO · Reno congestion control · fast retransmit       │
+  │                         │                                          │
+  │  TLS (tls/): ClientHello parsing → SNI blocklist → JA3 rate limit  │
+  │     → OpenSSL termination with memory BIOs                         │
+  │                         │                                          │
+  │  DPI (dpi/): Hyperscan streaming scan of plaintext                 │
+  │     (Snort/Suricata `content` rules)                               │
+  │                         │ clean                     │ match        │
+  │                         ▼                           ▼              │
+  │          epoll-driven loopback socket          RST to client       │
+  │          to the backend service                                    │
+  └─────────────────────────────┬─────────────────────────────────────┘
+                                │ AF_XDP TX ring (responses, ACKs, RSTs)
+                                ▼
+                             client
+```
+
+Responses from the backend are read through epoll, encrypted if the session is TLS, segmented to the client's MSS and sent through the AF_XDP TX ring with Aethon's own sequence numbers, retransmission timers and congestion window.
+
+## Features
+
+### Data plane (eBPF/XDP)
+- Port-based steering: only TCP ports listed in `rules/services.conf` reach userspace; all other traffic is passed to the kernel.
+- TCP fragment dropping (fragmented TCP is a classic evasion technique).
+- Multi-queue: one AF_XDP socket and one worker thread per NIC queue, pinned to its own core.
+- Zero-copy bind attempted first (`XDP_ZEROCOPY`), with automatic fallback to copy mode.
+
+### Userspace TCP stack
+- Three-way handshake with SipHash-2-4 initial sequence numbers (RFC 6528) and an MSS option.
+- Reassembly of out-of-order data in a 64 KB ring buffer with a byte-level bitmap.
+- **Overlap evasion detection:** a retransmission whose bytes disagree with data already buffered kills the session (Ptacek & Newsham, 1998).
+- Duplicate ACKs on reordering, flow control in both directions with real window advertisement and backpressure to and from the backend, window updates.
+- RFC 6298 retransmission timer (SRTT/RTTVAR, Karn's rule, exponential backoff), Reno congestion control (RFC 5681) with fast retransmit, go-back-N on timeout.
+- Graceful close in both directions, half-close (client FIN while the response is still being sent), FIN retransmission, RST handling, challenge ACKs for in-window SYNs (RFC 5961), RST/ACK for packets of unknown sessions.
+
+### TLS
+- ClientHello reassembly across segments (large post-quantum ClientHellos from modern browsers).
+- SNI policy: domains listed in `rules/blocked_domains.txt`, and their subdomains, are reset.
+- JA3 fingerprinting with a per-fingerprint rate limit.
+- TLS termination through OpenSSL memory BIOs, routed to a backend by SNI or by destination IP:port.
+
+### Deep packet inspection
+- Hyperscan **streaming mode**: patterns split across packets or TLS records are still detected.
+- Loads Snort/Suricata-style rules (`content`, `nocase`, `sid`, `msg`).
+
+## Quick start
+
+### Requirements
+- Linux with XDP and AF_XDP support (developed on kernel 6.x/7.x, x86_64)
+- A C++20 compiler (GCC 13+ or Clang 16+), CMake ≥ 3.20, clang/LLVM for the BPF program
+- Libraries: libxdp, libbpf, Hyperscan (libhs), OpenSSL 3, liburing
 
 ```bash
-sudo apt-get install libbpf-dev libxdp-dev clang llvm gcc make
+sudo apt install -y build-essential cmake clang llvm pkg-config \
+    libxdp-dev libbpf-dev libhyperscan-dev libssl-dev liburing-dev
 ```
 
-### **Compilation**
+### Build
+```bash
+git clone https://github.com/programmingGod-byte/Intrusion_Detection.git aethon
+cd aethon
+./build.sh --release          # or: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+```
 
-Compile the kernel BPF program and the user-space controller:
+### Run in a safe sandbox (veth + network namespace)
+Never try Aethon first on the interface you use for SSH. The repository includes a virtual test network:
 
 ```bash
-make
+sudo ./veth0.bash                                  # veth0 (192.168.50.1) <-> client_ns (192.168.50.2)
+sudo ./build/src/afxdp_control veth0               # attach and start the workers
+
+# from the client namespace:
+sudo ip netns exec client_ns curl -v http://192.168.50.1/
 ```
 
-### **Execution**
+For a complete setup with nginx and a Node.js app behind Aethon, see [`tests/web_app_test/`](tests/web_app_test/README.md).
 
-Run the pipeline by binding the socket to your network interface (e.g. `eth0` or `veth0`):
+To detach XDP: `sudo ip link set dev veth0 xdp off`
+
+## Configuration
+
+All configuration lives in `rules/` and is read at startup.
+
+| File | Purpose | Format |
+|---|---|---|
+| `rules/services.conf` | Protected services and their backends | `<domain or ip:port> <cert or none> <key or none> <backend_port>` |
+| `rules/blocked_domains.txt` | SNI blocklist (subdomains included) | one domain per line, `#` comments |
+| `rules/test_rules.rules` | DPI signatures | Snort/Suricata rules with `content`, `nocase`, `sid`, `msg` |
+
+Example `services.conf`:
+```
+192.168.50.1:443 certs/server.crt certs/server.key 8080   # TLS on :443, terminated, proxied to 127.0.0.1:8080
+192.168.50.1:80  none none 8080                           # plain HTTP on :80 → 127.0.0.1:8080
+api.example.com  certs/api.crt certs/api.key 5000         # TLS routed by SNI
+```
+
+Backends must listen on **127.0.0.1**. If they listen on `0.0.0.0`, clients can reach them directly on their own port and bypass Aethon.
+
+## Testing
+
+| Suite | Needs root | What it covers |
+|---|---|---|
+| `build/src/test_tcp_reassembly` | no | Targeted regression tests: resegmented retransmissions, overlap evasion, partial hole fills, ring wrap-around, SNI policy |
+| `build/src/test_tcp_fuzz [seeds] [bytes]` | no | Randomized reassembly under loss, reordering, duplicates, stale replays, out-of-window junk and tiny segments; the output stream must match byte for byte |
+| `tests/web_app_test/test.sh` | yes | Real clients through Aethon → nginx → Node.js: pages, APIs, keep-alive, sha256 of 5 MB downloads and 20 MB uploads over HTTP and HTTPS, DPI (plain and inside TLS), SNI blocking, bypass check; `--netem` adds delay and loss, `--load` runs wrk |
+| `tests/web_app_test/torture.sh` | yes | Network chaos in both directions (reorder, duplicates, jitter, burst loss, corruption, bandwidth caps), concurrency, connection churn with a leak check, protocol edge cases, adversarial clients (split-payload evasion, slowloris, aborted transfers, handshake floods, SYN floods) |
+| `tests/run_tests.sh` | yes | Older raw-packet scenarios: floods, fragmentation attacks, RST injection, JA3 rate limiting |
 
 ```bash
-sudo ./af_xdp_user <interface_name>
+cmake --build build -j && ./build/src/test_tcp_reassembly && ./build/src/test_tcp_fuzz
+cd tests/web_app_test && ./start.sh        # then start Aethon, then:
+./test.sh && ./test.sh --netem && ./torture.sh --quick
 ```
 
----
+Step-by-step instructions: [`tests/web_app_test/test.txt`](tests/web_app_test/test.txt).
 
-## ⚡ Aethon HFT Container Performance Benchmarks
+## Measured results
 
-All benchmarks are measured using CPU timestamp counters (`rdtsc`) with CPU core pinning (`pthread_setaffinity_np`) and `SCHED_FIFO` real-time scheduling on Linux (`sudo ./benchmark`).
+Measured on a laptop over veth in generic XDP mode, with wrk and nginx on the same machine. These numbers show behavior, not production performance; a real NIC in native zero-copy mode is a different environment.
 
-### **Raw Benchmark Terminal Output:**
+| Test | Result |
+|---|---|
+| End-to-end suite (`test.sh`) | 18/18 pass, also with 50 ms delay and 2% loss in the client's direction |
+| Static page through Aethon (wrk, 100 connections) | ~110k req/s, 1.9 ms average latency |
+| Same page from nginx directly | ~104k req/s, 1.0 ms average latency |
+| API request through Aethon → nginx → Node.js | ~54k req/s, 3.5 ms average latency |
+| Aethon resident memory after the load test | ~111 MB |
 
-```text
-=====================================================
-  AETHON HIGH-PERFORMANCE SUITE RDTSC BENCHMARKS
-=====================================================
+The nginx-direct baseline ran wrk on the host competing with nginx for the same cores, so read the comparison as "Aethon was not the bottleneck at ~100k req/s", not as Aethon being faster than nginx.
 
-----------------------------------------
-  Benchmarking std::deque + mutex (10M Ops) [Pinned Core 2 & 3]
-----------------------------------------
-std::deque Total CPU Cycles: 3516109960 cycles
-std::deque Avg Cycles / Op : 351.611 cycles/op
+## Known limitations
 
-----------------------------------------
-  Benchmarking SPSC Queue (10M Ops) [Pinned Core 2 & 3]
-----------------------------------------
-SPSC Total CPU Cycles: 181523856 cycles
-SPSC Avg Cycles / Op : 18.1524 cycles/op
+Being explicit about these is part of the project.
 
-----------------------------------------
-  Benchmarking MPMC Queue (10M Ops) [Pinned Core 2 & 3]
-----------------------------------------
-MPMC Total CPU Cycles: 337977960 cycles
-MPMC Avg Cycles / Op : 34.3978 cycles/op
+- **IPv4 only.** IPv6 is passed to the kernel uninspected.
+- **TCP checksums are not verified**, only the IPv4 header checksum. Corrupted segments can reach the backend.
+- **No window scaling or SACK.** At most 64 KB in flight, so throughput over long, lossy paths is far below Linux.
+- **No SYN cookies.** A spoofed SYN flood can fill the session table.
+- **Established sessions expire after 30 s idle**, shorter than typical browser and nginx keep-alive timeouts.
+- **No global memory budget.** Per-session buffers are capped, but a slow-read attack across many connections can still exhaust memory.
+- **Flows must stay on one RX queue.** Sessions live in per-worker tables; real NICs guarantee this through RSS, while multi-queue veth setups need `net.core.txrehash=0` on the client.
+- **The JA3 table is shared between worker threads without locking** and rate-limits per fingerprint globally (all clients of one TLS library share a JA3). It is work in progress.
+- **The XDP rate limiter and IP blocklist are implemented but disabled** in the BPF program.
+- **TLS handshakes and logging run on the packet threads**, so handshake floods and log floods slow down packet processing.
+- **ICMP is handled in userspace** (echo only); other ICMP types are dropped, which can break path MTU discovery.
 
-----------------------------------------
-  Benchmarking std::array (100M Short-Lived Arrays) [Pinned Core 2]
-----------------------------------------
-std::array Total Cycles: 154365224 cycles
-std::array Avg Cycles / Array (4 items): 1.54365 cycles/op
+## Project layout
 
-----------------------------------------
-  Benchmarking std::vector (100M Short-Lived Vectors) [Pinned Core 2]
-----------------------------------------
-std::vector Total Cycles: 9437069820 cycles
-std::vector Avg Cycles / Vector (4 items): 94.3707 cycles/op
-
-----------------------------------------
-  Benchmarking aethon::SmallVector (100M Short-Lived Vectors) [Pinned Core 2]
-----------------------------------------
-aethon::SmallVector Total Cycles: 271116068 cycles
-aethon::SmallVector Avg Cycles / Vector (4 items): 2.71116 cycles/op
-
-----------------------------------------
-  Benchmarking std::unordered_map + mutex (10M Concurrent Ops, 4 Threads)
-----------------------------------------
-std::unordered_map Total Cycles: 5749223434 cycles
-std::unordered_map Avg Cycles / Insert: 574.922 cycles/op
-
-----------------------------------------
-  Benchmarking aethon::LockFreeHashMap (10M Concurrent Ops, 4 Threads)
-----------------------------------------
-aethon::LockFreeHashMap Total Cycles: 849499644 cycles
-aethon::LockFreeHashMap Avg Cycles / Insert: 84.95 cycles/op
-
-=====================================================
-  ALL BENCHMARKS COMPLETED SUCCESSFULLY!
-=====================================================
+```
+aethon/                 lock-free queues, hash maps, small containers, allocation helpers
+src/main/afxdp_control.cpp   entry point: setup, AF_XDP RX/TX loop, workers, stats
+src/main/ebpf/          XDP program and maps
+src/main/transport/     TCP reassembly, pipeline, congestion control, UDP reassembly
+src/main/tls/           ClientHello/JA3 parser, OpenSSL engine, SNI blocklist, service registry
+src/main/dpi/           Hyperscan engine and Snort/Suricata rule parser
+src/main/net/           packet construction (SYN-ACK, data, ACK, FIN, RST)
+src/af_xdp_header.h     AF_XDP engine: UMEM, rings, socket setup
+rules/                  configuration and signature files
+tests/                  unit, fuzz, end-to-end and torture tests
+benchmarks/             microbenchmarks for the container library
+docs/                   design notes and the project website
 ```
 
-### 📊 **Performance Summary Matrix**
+## Roadmap
 
-| Category                            | Standard C++ / Naive Implementation                   | Aethon High-Performance Container                             | Latency Reduction  | Speed Multiplier       |
-| :---------------------------------- | :---------------------------------------------------- | :------------------------------------------------------------ | :----------------- | :--------------------- |
-| **SPSC Queue (1 Thread Pair)**      | `std::deque` + `std::mutex` (**351.61 cycles/op**)    | `aethon::detail::ProducerConsumerQueue` (**18.15 cycles/op**) | **-94.8% Latency** | ⚡ **~19.37x Faster**  |
-| **MPMC Queue (1 Thread Pair)**      | `std::deque` + `std::mutex` (**351.61 cycles/op**)    | `aethon::MpmcQueue` (**33.80 cycles/op**)                     | **-90.4% Latency** | ⚡ **~10.40x Faster**  |
-| **Small Vector (4 items)**          | `std::vector` (**94.37 cycles/op**)                   | `aethon::SmallVector<T, 4>` (**2.71 cycles/op**)              | **-97.1% Latency** | ⚡ **~34.81x Faster**  |
-| **Baseline Stack Array**            | `std::array<T, 4>` (**1.54 cycles/op**)               | `aethon::SmallVector<T, 4>` (**2.71 cycles/op**)              | Near Stack Speed   | Dynamic Growth Support |
-| **Concurrent Hash Map (4 Threads)** | `std::unordered_map` + `mutex` (**574.92 cycles/op**) | `aethon::LockFreeHashMap` (**84.95 cycles/op**)               | **-85.2% Latency** | ⚡ **~6.77x Faster**   |
+1. TCP checksum verification, SYN cookies, longer idle timeout with keep-alive handling.
+2. Global memory budget with backpressure, fail-open (detach XDP if the process dies).
+3. Asynchronous logging: per-worker lock-free rings, a logger thread, rate-limited events.
+4. Window scaling and SACK.
+5. Native-mode benchmarks on a real NIC; comparison with Suricata + nginx.
 
-### 🛠️ **Build & Run Aethon Benchmarks**
+## Contributing, security and conduct
 
-```bash
-# Navigate to directory
-cd /home/shivam/Desktop/learning/advanceCpp/Aethon
+- [CONTRIBUTING.md](CONTRIBUTING.md): build, test and pull request guidelines
+- [SECURITY.md](SECURITY.md): how to report a vulnerability privately
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): expectations for everyone in the project
+- [ACCESSIBILITY.md](ACCESSIBILITY.md): accessibility commitment and known barriers
 
-# Compile with full -O3 optimizations
-g++ -O3 -std=c++20 -DAETHON_NO_MAIN -Wno-interference-size -I. benchmark.cpp -o benchmark -lpthread
+## References
 
-# Run benchmark suite with real-time OS permissions
-sudo ./benchmark
-```
+- Ptacek & Newsham, [Insertion, Evasion, and Denial of Service: Eluding Network Intrusion Detection](https://users.ece.cmu.edu/~adrian/731-sp04/readings/Ptacek-Newsham-ids98.pdf), 1998
+- Jeong et al., [mTCP: a Highly Scalable User-level TCP Stack for Multicore Systems](https://www.usenix.org/system/files/conference/nsdi14/nsdi14-paper-jeong.pdf), NSDI 2014
+- Jamshed et al., [Kargus: A Highly-Scalable Software-based Intrusion Detection System](https://dl.acm.org/doi/pdf/10.1145/2382196.2382232), ACM CCS 2012
+- Cloudflare, [Unimog: Cloudflare's edge load balancer](https://blog.cloudflare.com/unimog-cloudflares-edge-load-balancer/)
+- RFC 5681 (congestion control), RFC 6298 (retransmission timer), RFC 6528 (ISN generation), RFC 5961 (blind in-window attacks)
 
-## Academic Research & Architecture References
-The Aethon architecture is heavily inspired by the following foundational papers in high-performance networking and DPI:
+## License
 
-* **The Security Foundation (TCP Evasion):**
-  [Insertion, Evasion, and Denial of Service: Eluding Network Intrusion Detection](https://users.ece.cmu.edu/~adrian/731-sp04/readings/Ptacek-Newsham-ids98.pdf) (Ptacek & Newsham, 1998)
-* **User-Space TCP Architecture:**
-  [mTCP: a Highly Scalable User-level TCP Stack for Multicore Systems](https://www.usenix.org/system/files/conference/nsdi14/nsdi14-paper-jeong.pdf) (NSDI '14)
-* **GPU-Accelerated DPI:**
-  [Kargus: A Highly-Scalable Software-based Intrusion Detection System](https://dl.acm.org/doi/pdf/10.1145/2382196.2382232) (ACM CCS '12)
-* **Modern eBPF/XDP Edge Architecture:**
-  [Unimog: Cloudflare's Edge Load Balancer](https://blog.cloudflare.com/unimog-cloudflares-edge-load-balancer/) (Cloudflare Engineering)
-
-### 🛡️ Overcoming the 1998 IDS Evasion Dilemmas
-The original 1998 Ptacek & Newsham research highlighted several structural vulnerabilities in passive network sniffers (traditional IDSs). Aethon's modern **Inline AF_XDP Architecture** natively mitigates these historic attack vectors:
-
-* **TCB Poisoning (Fake Handshakes):** Traditional passive IDSs can be tricked by forged `SYN-ACK` packets, causing desynchronization from the real TCP stream. Because Aethon acts as an **Active Inline Gatekeeper** directly on the host NIC, an attacker cannot spoof the backend server's `SYN-ACK` response without physically compromising the server itself. 
-* **PAWS (Protect Against Wrapped Sequences):** Passive IDSs that miss the 3-Way Handshake cannot determine if TCP Timestamps (Kind 8) were negotiated, leading to evasion via overlapping fragments. Aethon aggressively enforces 3-Way Handshake tracking via eBPF LRU maps. If the handshake is missed or invalid, data packets are dropped at the driver level (`XDP_DROP`).
-* **Restart Blindness:** When a passive IDS restarts, it becomes "blind" to existing mid-stream connections and can be exploited. Because Aethon controls the packet flow natively, restarting the engine securely drops the in-memory state. This actively forces legitimate clients to re-initiate a valid `SYN`, quickly restoring 100% verified state tracking without leaving the engine vulnerable to mid-stream TCP injections.
+Aethon is released under the [MIT License](LICENSE), except:
+- `src/main/ebpf/xdp_kern_prog.c` is licensed under GPL-2.0, as declared to the kernel in the program itself;
+- third-party rule sets in `rules/` keep their own licenses (see the license files in that directory).

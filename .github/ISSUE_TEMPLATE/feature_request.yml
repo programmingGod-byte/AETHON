@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest a new capability or an improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that Aethon doesn't support well today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How it could work. For packet-path changes, mention the expected per-packet cost and memory use.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked the README's Known limitations and Roadmap for this already.
+          required: true
+        - label: I'm willing to help implement or test this.

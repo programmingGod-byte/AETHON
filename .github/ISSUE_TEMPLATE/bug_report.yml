@@ -1,0 +1,67 @@
+name: Bug report
+description: Something in Aethon behaves incorrectly (wrong data, reset connections, crash, leak, hang)
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security vulnerabilities must not be reported here**; use the private process in SECURITY.md instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+      placeholder: "A 20 MB HTTPS upload through Aethon is reset after ~5 MB when netem adds 2% loss."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, ideally on the veth test network (veth0.bash or tests/web_app_test/start.sh).
+      placeholder: |
+        1. ./tests/web_app_test/start.sh
+        2. sudo ./build/src/afxdp_control veth0
+        3. ./tests/web_app_test/test.sh --netem
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      multiple: true
+      options:
+        - XDP / eBPF program
+        - AF_XDP rings / UMEM
+        - TCP stack (handshake, reassembly, retransmission, flow control)
+        - TLS (termination, SNI, JA3)
+        - DPI / Hyperscan rules
+        - Backend proxying
+        - Configuration (rules/*)
+        - Tests / scripts
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Aethon output and test results
+      description: Relevant afxdp_control output, test.sh / torture.sh summary, and `ss -tni` output if a connection hangs.
+      render: text
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD`
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Kernel (`uname -r`), distribution, NIC/driver or veth, XDP mode (native / generic), number of queues, compiler.
+      placeholder: "Linux 7.0.0-38-generic, Ubuntu 26.04, veth with 4 queues, generic XDP, GCC 13"
+    validations:
+      required: true
