@@ -159,6 +159,25 @@ static void test_partial_fill_keeps_tracking() {
     CHECK(alive, "stream survives ring wrap-around after partial fills (no stale bitmap bits)");
 }
 
+// A sender retransmits data we already have when our ACK was lost. It must be ACKed again,
+// and a retransmission that also carries new bytes must deliver them (it was once dropped
+// silently because an unsigned window check treated "behind" as "4 GB ahead").
+static void test_old_data_is_reacked() {
+    std::puts("retransmission of already received data");
+    auto data = pattern(8192, 77);
+    Conn c(40004);
+
+    c.send(data, 0, 536);
+    c.send(data, 536, 536);                               // rcv_nxt = 1072
+    auto dup = c.send(data, 0, 536);                      // fully old
+    CHECK(dup.session && dup.need_ack && !dup.is_ready, "fully old segment is re-ACKed");
+
+    auto part = c.send(data, 536, 1072);                  // [536, 1608): half old, half new
+    CHECK(part.is_ready && part.payload_len == 536, "partly old segment delivers only its new bytes");
+    CHECK(part.is_ready && std::memcmp(part.payload, data.data() + 1072, 536) == 0,
+          "delivered bytes are the new ones");
+}
+
 // Reference RFC 1071 checksum, computed the textbook way (big-endian 16-bit words)
 static uint16_t reference_tcp_checksum(uint32_t saddr_be, uint32_t daddr_be, const uint8_t *seg, size_t len) {
     uint32_t sum = 0;
@@ -273,6 +292,7 @@ int main() {
     test_conflicting_overlap_detected();
     test_identical_duplicate_accepted();
     test_partial_fill_keeps_tracking();
+    test_old_data_is_reacked();
     test_tcp_checksum();
     test_syn_cookies();
     test_domain_policy();

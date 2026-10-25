@@ -67,10 +67,15 @@ std::string run(const Profile &pf, uint32_t seed, size_t total) {
     out.reserve(total);
 
     bool alive = true;
+    size_t unacked_old = 0;
     auto feed = [&](uint32_t seq, const uint8_t *data, size_t len) {
+        // A segment that ends at or before what we already delivered is a retransmission; the
+        // receiver must answer it with an ACK, otherwise the sender backs off until it stalls.
+        const bool fully_old = (seq - (isn + 1)) + len <= out.size();
         Packet p = make(seq, TH_ACK, sport);
         auto r = engine.process_packet(&p.ip, &p.tcp, data, static_cast<uint16_t>(len), now += 1000);
         if (!r.session) { alive = false; return; }
+        if (fully_old && !r.need_ack) ++unacked_old;
         if (r.is_ready && r.payload_len) out.insert(out.end(), r.payload, r.payload + r.payload_len);
     };
 
@@ -130,6 +135,7 @@ std::string run(const Profile &pf, uint32_t seed, size_t total) {
     }
 
     if (!alive) return "session killed after " + std::to_string(out.size()) + " bytes";
+    if (unacked_old) return std::to_string(unacked_old) + " retransmissions of old data got no ACK";
     if (out.size() != total) return "delivered " + std::to_string(out.size()) + " of " + std::to_string(total);
     if (std::memcmp(out.data(), stream.data(), total) != 0) {
         size_t i = 0;

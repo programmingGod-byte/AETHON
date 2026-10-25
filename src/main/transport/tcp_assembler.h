@@ -970,17 +970,13 @@ namespace aethon {
                     const uint8_t * cur_payload = payload;
                     uint16_t cur_len = payload_len;
 
-                    // protect against spoofed out -of -window-sequences
-
-                    if(AETHON_UNLIKELY(TcpSeq::diff(cur_seq, session->rcv_nxt) + cur_len > AETHON_TCP_WINDOW_SIZE)){
-                        return result;
-                    }
-
-                    // packet completelybehinf rcv_nxt
+                    // packet completely behind rcv_nxt: a retransmission of data we already have.
+                    // It MUST be ACKed: the sender retransmits because our ACK was lost, and without a
+                    // new ACK it backs off exponentially until the connection stalls.
 
                     if(AETHON_UNLIKELY(TcpSeq::lte(cur_seq+cur_len,session->rcv_nxt))){
                         result.need_ack = true;
-                        return result; 
+                        return result;
                     }
 
                     // partial overlap Packet starts before rcv_nxt , but end after rcv_nxt
@@ -990,6 +986,13 @@ namespace aethon {
                         cur_payload  += trim;
                         cur_len      -= trim;
                         cur_seq       = session->rcv_nxt;
+                    }
+
+                    // protect against spoofed out-of-window sequences. Checked only after the two cases
+                    // above: the difference is unsigned, so data behind rcv_nxt would look 4 GB ahead.
+
+                    if(AETHON_UNLIKELY(TcpSeq::diff(cur_seq, session->rcv_nxt) + cur_len > AETHON_TCP_WINDOW_SIZE)){
+                        return result;
                     }
 
                     // In-order packet (packet matches rcv_nxt AND no out-of-order bytes are buffered)
