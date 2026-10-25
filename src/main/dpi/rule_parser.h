@@ -202,6 +202,7 @@ These keywords ONLY apply if there was a previous content keyword before them!
 #include <algorithm>
 #include <charconv>
 #include <filesystem>
+#include <cstdio>
 
 
 namespace aethon {
@@ -243,6 +244,7 @@ namespace aethon {
             // Relative Position Modifiers (Relative to previous content match)
             int32_t distance{-1};     // Must start at least N bytes after prev match
             int32_t within{-1};       // Must finish within N bytes after prev match
+            std::string bytes;        // Decoded literal bytes (|hex| expanded), used for byte offsets and tests
         };
 
 
@@ -276,8 +278,57 @@ namespace aethon {
             std::string confidence;                 // e.g. "High", "Medium", "Low"
             std::string severity;                   // e.g. "Critical", "Major", "Informational"
             std::string reference;                  // Reference URL or Bugtraq ID
+
+            // Applicability (filled by the parser) and policy (filled by the loader)
+            bool inbound{true};                     // client -> protected server direction
+            std::string unsupported;                // first condition Aethon cannot evaluate ("" = none)
+            bool pcre_nocase{false};                // pcre 'i' flag
+            bool block{true};                       // a match resets the connection (false = log only)
+            bool trusted{true};                     // from a "block" (local) file: exempt from the weak-pattern filter
         };
 
+
+        // Decodes Suricata content syntax ("abc|0d 0a|") into the literal bytes it matches
+        inline std::string decode_content_bytes(std::string_view raw){
+            std::string out;
+            bool in_hex = false;
+            int hi = -1;
+            auto hv = [](char c) noexcept -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            for (size_t i = 0; i < raw.size(); ++i) {
+                char c = raw[i];
+                if (c == '|') { in_hex = !in_hex; hi = -1; continue; }
+                if (in_hex) {
+                    int v = hv(c);
+                    if (v < 0) continue;
+                    if (hi < 0) { hi = v; } else { out.push_back(static_cast<char>((hi << 4) | v)); hi = -1; }
+                } else if (c == '\\' && i + 1 < raw.size()) {
+                    out.push_back(raw[++i]);           // escaped ; " \\ in content
+                } else {
+                    out.push_back(c);
+                }
+            }
+            return out;
+        }
+
+        // Sticky buffers / modifiers that refer to the HTTP *request*. Content after them is still
+        // found in the raw request stream Aethon scans (broader, but correct direction).
+        inline bool is_request_buffer(std::string_view key) noexcept {
+            static constexpr std::string_view kOk[] = {
+                "http.uri", "http_uri", "http.uri.raw", "http_raw_uri", "http.method", "http_method",
+                "http.header", "http_header", "http.header.raw", "http_raw_header", "http.request_line",
+                "http.host", "http_host", "http.host.raw", "http_raw_host", "http.user_agent", "http_user_agent",
+                "http.cookie", "http_cookie", "http.request_body", "http_client_body", "http.content_type",
+                "http.content_len", "http.referer", "http.accept", "http.accept_lang", "http.accept_enc",
+                "http.header_names", "http.start", "http.connection", "http.protocol", "http.request_header",
+                "pkt_data", "raw", "urilen"};
+            for (auto k : kOk) if (key == k) return true;
+            return false;
+        }
 
         AETHON_ALWAYS_INLINE std::string normalize_content_to_regex(std::string_view raw){
             std::string out;
@@ -445,6 +496,16 @@ namespace aethon {
                 return std::nullopt;
             }
             
+            // Direction: Aethon inspects client -> server traffic towards protected services, so
+            // outbound rules ($HOME_NET -> $EXTERNAL_NET, e.g. malware C2) do not apply
+            {
+                const std::string_view src = tokens[2], dir = tokens[4], dst = tokens[5];
+                const bool dst_external = dst.find("EXTERNAL_NET") != std::string_view::npos;
+                const bool src_home = src.find("HOME_NET") != std::string_view::npos ||
+                                      src.find("_SERVERS") != std::string_view::npos;
+                rule.inbound = !(dir == "->" && (dst_external || (src_home && dst != "any")));
+            }
+
             // Ports
             rule.src_port = parse_port_range(tokens[3]);
             rule.dst_port = parse_port_range(tokens[6]);
@@ -515,6 +576,10 @@ namespace aethon {
                     val.remove_prefix(1);
                 }
                 rc.pattern = normalize_content_to_regex(unquote(val));
+                rc.bytes = decode_content_bytes(unquote(val));
+                if (rc.is_negated && rule.unsupported.empty()) {
+                    rule.unsupported = "negated content";   // would turn into a positive match
+                }
                 rule.contents.push_back(std::move(rc));
             } else if (key == "nocase") {
                 if (!rule.contents.empty()) {
@@ -556,12 +621,31 @@ namespace aethon {
                     if (last_slash != std::string_view::npos && last_slash > 0) {
                         rule.pcre_regex = std::string(raw_pcre.substr(1, last_slash - 1));
                         rule.has_pcre = true;
+                        rule.pcre_nocase = raw_pcre.substr(last_slash + 1).find('i') != std::string_view::npos;
                     }
                 }
+            } else if ((key == "flowbits" || key == "xbits") &&
+                       (val.find("isset") != std::string_view::npos || val.find("isnotset") != std::string_view::npos)) {
+                if (rule.unsupported.empty()) rule.unsupported = "flowbits/xbits condition";
+            } else if (key == "byte_test" || key == "byte_jump" || key == "byte_extract" || key == "byte_math" ||
+                       key == "dsize" || key == "isdataat" || key == "base64_decode" || key == "base64_data" ||
+                       key == "stream_size" || key == "ssl_state" || key == "app-layer-event" || key == "asn1") {
+                if (rule.unsupported.empty()) rule.unsupported = std::string(key);
+            } else if (key == "startswith" || key == "endswith" || key == "bsize") {
+                // Anchored to a specific parsed buffer; on the raw reassembled stream "POST /"
+                // with startswith would match the request line of every request (false positive).
+                if (rule.unsupported.empty()) rule.unsupported = std::string(key);
+            } else if (colon == std::string_view::npos && !is_request_buffer(key) &&
+                       (key.find('.') != std::string_view::npos || key.rfind("http_", 0) == 0 ||
+                        key == "file_data" || key.rfind("ja3", 0) == 0)) {
+                // Sticky buffer outside the HTTP request (response, TLS metadata, DNS, files, ...)
+                if (rule.unsupported.empty()) rule.unsupported = "buffer " + std::string(key);
             } else if (key == "flow") {
                 if (val.find("established") != std::string_view::npos) rule.flow_established = true;
                 if (val.find("to_server")   != std::string_view::npos) rule.flow_to_server   = true;
                 if (val.find("to_client")   != std::string_view::npos) rule.flow_to_client   = true;
+                if (val.find("from_server") != std::string_view::npos) rule.flow_to_client   = true;
+                if (val.find("from_client") != std::string_view::npos) rule.flow_to_server   = true;
             } else if (key == "reference") {
                 size_t comma = val.find(',');
                 if (comma != std::string_view::npos) {
@@ -638,6 +722,102 @@ namespace aethon {
         }
 
 
+
+        // How a rule file is used (rules/rulesets.conf)
+        enum class LoadMode : uint8_t {
+            BLOCK,   // every match resets the connection (local/custom rules)
+            POLICY,  // reset only for attack classes / high severity / drop rules, otherwise log
+            ALERT    // log only
+        };
+
+        struct LoadStats {
+            size_t parsed{0};
+            size_t loaded{0};
+            size_t blocking{0};
+            size_t skipped_outbound{0};       // $HOME_NET -> $EXTERNAL_NET or server responses
+            size_t skipped_protocol{0};       // not TCP
+            size_t skipped_unsupported{0};    // conditions Aethon cannot evaluate
+            void add(const LoadStats &o) noexcept {
+                parsed += o.parsed; loaded += o.loaded; blocking += o.blocking;
+                skipped_outbound += o.skipped_outbound; skipped_protocol += o.skipped_protocol;
+                skipped_unsupported += o.skipped_unsupported;
+            }
+        };
+
+        // Classes that describe an attack on the protected server, as opposed to policy or
+        // informational signatures (e.g. "a curl user-agent was seen")
+        static bool is_attack_class(std::string_view classtype) noexcept {
+            static constexpr std::string_view kAttack[] = {
+                "web-application-attack", "attempted-admin", "attempted-user", "successful-admin",
+                "successful-user", "shellcode-detect", "trojan-activity", "exploit-kit",
+                "command-and-control", "attempted-dos", "denial-of-service"};
+            for (auto k : kAttack) if (classtype == k) return true;
+            return false;
+        }
+
+        // Loads a rule file, keeping only rules Aethon can evaluate correctly on inbound TCP
+        // streams, and decides per rule whether a match blocks or only logs.
+        LoadStats load_with_policy(const std::string &filepath, LoadMode mode) {
+            LoadStats st;
+            FILE *fp = fopen(filepath.c_str(), "r");
+            if (!fp) return st;
+            char *line_buf = nullptr;
+            size_t len = 0;
+            ssize_t n = 0;
+            while ((n = getline(&line_buf, &len, fp)) != -1) {
+                while (n > 0 && (line_buf[n - 1] == '\n' || line_buf[n - 1] == '\r')) line_buf[--n] = '\0';
+                auto opt = parse_rule_line(std::string_view(line_buf, static_cast<size_t>(n)));
+                if (!opt) continue;
+                AethonRule &r = *opt;
+                ++st.parsed;
+                if (r.protocol != RuleProtocol::TCP && r.protocol != RuleProtocol::ANY) { ++st.skipped_protocol; continue; }
+                if (!r.inbound || r.flow_to_client) { ++st.skipped_outbound; continue; }
+                if (!r.unsupported.empty() || (r.contents.empty() && !r.has_pcre)) { ++st.skipped_unsupported; continue; }
+
+                const bool high_severity = r.severity == "Major" || r.severity == "Critical";
+                const bool drop_action = r.action == RuleAction::DROP || r.action == RuleAction::REJECT;
+                r.block = mode == LoadMode::BLOCK ||
+                          (mode == LoadMode::POLICY && (drop_action || high_severity || is_attack_class(r.classtype)));
+                r.trusted = mode == LoadMode::BLOCK;
+                st.blocking += r.block;
+                ++st.loaded;
+                rules_.push_back(std::move(r));
+            }
+            if (line_buf) free(line_buf);
+            fclose(fp);
+            return st;
+        }
+
+        // rules/rulesets.conf: one "<path> <block|policy|alert>" per line, '#' comments.
+        // Relative paths are resolved against the directory of the conf file's parent (repo root).
+        LoadStats load_rulesets(const std::string &conf_path, bool verbose = true) {
+            LoadStats total;
+            FILE *fp = fopen(conf_path.c_str(), "r");
+            if (!fp) return total;
+            const std::filesystem::path base = std::filesystem::path(conf_path).parent_path().parent_path();
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                std::string_view l(line);
+                while (!l.empty() && (l.back() == '\n' || l.back() == '\r' || l.back() == ' ')) l.remove_suffix(1);
+                while (!l.empty() && (l.front() == ' ' || l.front() == '\t')) l.remove_prefix(1);
+                if (l.empty() || l.front() == '#') continue;
+                size_t sp = l.find_first_of(" \t");
+                std::string_view file = l.substr(0, sp);
+                std::string_view mode_s = sp == std::string_view::npos ? "policy" : l.substr(l.find_first_not_of(" \t", sp));
+                LoadMode mode = mode_s.rfind("block", 0) == 0 ? LoadMode::BLOCK
+                              : mode_s.rfind("alert", 0) == 0 ? LoadMode::ALERT : LoadMode::POLICY;
+                std::filesystem::path fpth(file);
+                if (fpth.is_relative()) fpth = base / fpth;
+                LoadStats st = load_with_policy(fpth.string(), mode);
+                if (verbose) {
+                    printf("  %-48s %-6.*s parsed %6zu  loaded %6zu  blocking %6zu\n", fpth.filename().c_str(),
+                           static_cast<int>(mode_s.size()), mode_s.data(), st.parsed, st.loaded, st.blocking);
+                }
+                total.add(st);
+            }
+            fclose(fp);
+            return total;
+        }
 
         // Load an entire .rules file from disk
         size_t load_from_file(const std::string &filepath) {

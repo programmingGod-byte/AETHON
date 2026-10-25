@@ -17,6 +17,8 @@
 #endif
 
 #include "tcp_assembler.h"
+#include "ip_address.h"
+#include "event_counters.h"
 #include "hyper_scan_engine.h"
 #include "packet_injector.h"
 #include <cstddef>
@@ -39,51 +41,68 @@
 
 namespace aethon {
 namespace pipeline {
-    static constexpr size_t MAX_JA3_IPS = 65536;
-    struct rate_lim_ja3{
-        std::atomic<uint16_t> tokens{0};
-        std::atomic<uint64_t> last_updated{0};
-        uint16_t limit{10};
-        uint64_t window{10};
+    // Per-worker JA3 rate limiter.
+    //
+    // The earlier design shared one SingleThreadHashMap across all four worker threads and relied
+    // on std::atomic fields inside the value. That is unsafe: the atomics only protect individual
+    // fields of a value you already own, but find()/insert() touch the map's own cells, probe chain
+    // and size_ (all plain, non-atomic) concurrently -> a data race (undefined behavior). insert()
+    // also copy-assigns the whole value, racing with another thread's atomic RMW on that same value
+    // and copying a 256 KB IP array on the packet path. The value was 256 KB per fingerprint and the
+    // limit was global, so every client of one TLS library (all curl, all Chrome) shared one counter.
+    //
+    // Aethon already keeps one session table per worker and a flow always returns to the same worker
+    // via RSS, so the correct design is a per-worker limiter: single-threaded, no atomics, no locks.
+    // The ceiling is therefore per-worker; with N queues one fingerprint can reach up to N x limit
+    // across all source IPs, which is acceptable for coarse flood control.
+    class Ja3RateLimiter {
+    public:
+        struct Config { uint32_t limit = 60; uint64_t window_ns = 10'000'000'000ULL; };
 
-        rate_lim_ja3() = default;
-        rate_lim_ja3(const rate_lim_ja3 &o) noexcept
-            : tokens(o.tokens.load(std::memory_order_relaxed)),
-              last_updated(o.last_updated.load(std::memory_order_relaxed)),
-              limit(o.limit), window(o.window) {}
-        rate_lim_ja3 &operator=(const rate_lim_ja3 &o) noexcept {
-            if (this != &o) {
-                tokens.store(o.tokens.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                last_updated.store(o.last_updated.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                limit = o.limit;
-                window = o.window;
-            }
-            return *this;
-        }
-    };
-    struct ja3_ips{
-        uint32_t ips[MAX_JA3_IPS]{};
-        struct rate_lim_ja3 rate_lim{};
-        std::atomic<int> offset{0};
+        Ja3RateLimiter() : map_(4096) {}
+        explicit Ja3RateLimiter(Config cfg) : cfg_(cfg), map_(4096) {}
 
-        ja3_ips() = default;
-        ja3_ips(const ja3_ips &o) noexcept
-            : rate_lim(o.rate_lim),
-              offset(o.offset.load(std::memory_order_relaxed)) {
-            std::memcpy(ips, o.ips, sizeof(ips));
-        }
-        ja3_ips &operator=(const ja3_ips &o) noexcept {
-            if (this != &o) {
-                std::memcpy(ips, o.ips, sizeof(ips));
-                rate_lim = o.rate_lim;
-                offset.store(o.offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        // true => this ClientHello is over its fingerprint's limit and should be dropped
+        bool should_block(const tls::JA3 &fp, uint32_t src_ip, uint64_t now_ns) noexcept {
+            if (fp.curr_id <= 0) return false;          // no fingerprint (also the map's empty key)
+            Stat *s = map_.find(fp);
+            if (!s) {
+                if (map_.size() >= kMaxFingerprints) return false;   // table full: fail open
+                Stat fresh;
+                fresh.window_start_ns = now_ns;
+                fresh.count = 1;
+                fresh.sample_ips[0] = src_ip;
+                fresh.sample_count = 1;
+                map_.insert(fp, fresh);
+                return false;
             }
-            return *this;
+            if (now_ns - s->window_start_ns > cfg_.window_ns) {
+                s->window_start_ns = now_ns;
+                s->count = 0;
+                s->sample_count = 0;
+            }
+            ++s->count;
+            bool seen = false;
+            for (uint8_t i = 0; i < s->sample_count; ++i) if (s->sample_ips[i] == src_ip) { seen = true; break; }
+            if (!seen && s->sample_count < kSamples) s->sample_ips[s->sample_count++] = src_ip;
+            return s->count > cfg_.limit;
         }
+
+        size_t tracked() const noexcept { return map_.size(); }
+
+    private:
+        static constexpr uint8_t kSamples = 8;
+        static constexpr size_t kMaxFingerprints = 4000;   // < map capacity, bounds memory
+        struct Stat {
+            uint64_t window_start_ns{0};
+            uint32_t count{0};
+            uint32_t sample_ips[kSamples]{};   // a few distinct source IPs seen, for logging
+            uint8_t sample_count{0};
+        };
+        Config cfg_;
+        aethon::SingleThreadHashMap<tls::JA3, Stat> map_;
     };
-    using JA3_map = aethon::SingleThreadHashMap<aethon::tls::JA3, struct ja3_ips>;
-    inline JA3_map g_ja3_map{1024};
-    inline JA3_map* ja3_map{&g_ja3_map};
+
     AETHON_ALWAYS_INLINE void print_ip(uint32_t ip) noexcept {
         char buf[INET_ADDRSTRLEN];
         struct in_addr addr;
@@ -343,7 +362,8 @@ namespace pipeline {
         IPv4TcpAssembler::TcpAssemblerEngine & __restrict__ tcp_engine,
         Scanner & __restrict__ scanner,
         std::vector<uint64_t>&tx_pool ,
-    int epfd) noexcept
+    int epfd,
+        Ja3RateLimiter & __restrict__ ja3) noexcept
     {
         const size_t ip_hdr_len = iph->ihl * 4;
 
@@ -368,8 +388,24 @@ namespace pipeline {
         const uint16_t payload_len = total_ip_len - ip_hdr_len - tcp_hdr_len;
         const uint8_t * __restrict__ payload = reinterpret_cast<const uint8_t *>(tcph) + tcp_hdr_len;
 
+        // Drop corrupted segments like the kernel does; the sender retransmits. Without this a
+        // flipped flag (e.g. RST), port or sequence number would be acted upon.
+        if (AETHON_UNLIKELY(!Ipv4::is_valid_tcp_checksum(
+                iph, reinterpret_cast<const uint8_t *>(tcph), total_ip_len - ip_hdr_len))) {
+            stats::count(stats::Event::TcpBadChecksum);
+            return false;
+        }
+
         IPv4TcpAssembler::TcpAssemblyResult res = tcp_engine.process_packet(
             iph, tcph, payload, payload_len, now_ns);
+
+        if (AETHON_UNLIKELY(res.syn_cookie)) {
+            if (!g_service_registry.is_managed_port(ntohs(tcph->dest))) {
+                return false;
+            }
+            return net::PacketInjector::ipv4_send_tcp_syn_ack(
+                sock, buf_addr, pkt, eth, iph, tcph, res.syn_cookie_isn, ntohl(tcph->seq));
+        }
 
         if (AETHON_UNLIKELY(!res.session)) {
             uint8_t flags = reinterpret_cast<const uint8_t *>(tcph)[13];
@@ -383,8 +419,14 @@ namespace pipeline {
                 return net::PacketInjector::ipv4_send_tcp_ack(
                     sock, buf_addr, pkt, eth, iph, tcph, ntohl(tcph->ack_seq), ntohl(tcph->seq) + payload_len + 1, 0);
             }
+            stats::count(res.overlap_violation ? stats::Event::RstOverlapEvasion : stats::Event::RstNoSession);
             return net::PacketInjector::ipv4_send_tcp_rst(
                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+        }
+
+        if (AETHON_UNLIKELY(res.from_cookie)) {
+            std::memcpy(res.session->client_mac, eth->ether_shost, 6);
+            std::memcpy(res.session->server_mac, eth->ether_dhost, 6);
         }
 
         if (AETHON_UNLIKELY(res.fast_retransmit && res.session)) {
@@ -474,14 +516,20 @@ namespace pipeline {
 
             // Handle multi-segment ClientHello (e.g., Chrome with post-quantum keys > 1460 bytes MTU)
             if(res.session && res.session->tls_conn.status() == tls::TlsSessionStatus::IDLE){
+                // A ClientHello can only start at the very first byte of the stream. Plain sessions
+                // stay IDLE forever, so without this check any upload segment that happened to start
+                // with 0x16 ... 0x01 (about 1 in 65536) was parsed as TLS and usually reset.
+                const bool stream_start = !res.session->app_data_seen;
+                res.session->app_data_seen = true;
                 // Check if an accumulation is already in progress or if this packet starts a TLS ClientHello
-                if (!res.session->client_hello_buf.empty() || 
-                    (res.payload_len >= 6 && res.payload[0] == 0x16 && res.payload[5] == 0x01)) {
+                if (!res.session->client_hello_buf.empty() ||
+                    (stream_start && res.payload_len >= 6 && res.payload[0] == 0x16 && res.payload[5] == 0x01)) {
 
                     // Reject connections exceeding maximum allowable TLS record size
                     if (AETHON_UNLIKELY(res.session->client_hello_buf.size() + res.payload_len > MAX_CLIENT_HELLO)) {
                         res.session->client_hello_buf.clear();
                         tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                        stats::count(stats::Event::RstBadClientHello);
                         return net::PacketInjector::ipv4_send_tcp_rst(
                             sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                     }
@@ -498,6 +546,7 @@ namespace pipeline {
                             // Malformed TLS record length exceeding RFC limit; abort connection
                             res.session->client_hello_buf.clear();
                             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            stats::count(stats::Event::RstBadClientHello);
                             return net::PacketInjector::ipv4_send_tcp_rst(
                                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                         }
@@ -510,50 +559,16 @@ namespace pipeline {
                 }
             }
 
+            // Parse complete ClientHello to extract SNI and enforce domain policy
             auto tls_info = tls::parse_client_hello(hello_data, hello_len);
-            bool exceed = false;  
             if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(tls_info.is_client_hello, 1, 0.02)) {
-                if (ja3_map && tls_info.ja3_str.curr_id > 0) {
-                    auto *value = ja3_map->find(tls_info.ja3_str);
-                    if (AETHON_UNLIKELY(value)) {
-                        int off = value->offset.fetch_add(1, std::memory_order_relaxed);
-                        if (AETHON_LIKELY(off < static_cast<int>(MAX_JA3_IPS))) {
-                            value->ips[off] = iph->saddr;
-                        }
-                        const uint64_t window_ns = value->rate_lim.window * 1000000000ULL;
-                        uint64_t last = value->rate_lim.last_updated.load(std::memory_order_relaxed);
-                        if (now_ns - last > window_ns) {
-                            if (value->rate_lim.last_updated.compare_exchange_strong(last, now_ns, std::memory_order_relaxed)) {
-                                value->rate_lim.tokens.store(1, std::memory_order_relaxed);
-                            } else {
-                                if (value->rate_lim.tokens.fetch_add(1, std::memory_order_relaxed) >= value->rate_lim.limit) {
-                                    exceed = true;
-                                }
-                            }
-                        } else {
-                            if (value->rate_lim.tokens.fetch_add(1, std::memory_order_relaxed) >= value->rate_lim.limit) {
-                                exceed = true;
-                            }
-                        }
-                    } else {
-                        struct ja3_ips new_ip_list{};
-                        int off = new_ip_list.offset.fetch_add(1, std::memory_order_relaxed);
-                        new_ip_list.ips[off] = iph->saddr;
-                        new_ip_list.rate_lim.tokens.store(1, std::memory_order_relaxed);
-                        new_ip_list.rate_lim.window = 10;
-                        new_ip_list.rate_lim.limit = 10;
-                        new_ip_list.rate_lim.last_updated.store(now_ns, std::memory_order_relaxed);
-                        ja3_map->insert(tls_info.ja3_str, new_ip_list);
-                    }
-                }
-                if (AETHON_UNLIKELY(exceed)) {
-                    std::cout << "\n[IPS RATE-LIMIT] JA3 Fingerprint Limit Exceeded! Dropping ClientHello." << std::endl;
-                    std::cout << "  Attacker : ";
-                    print_ip(iph->saddr);
-                    std::cout << ":" << ntohs(tcph->source) << std::endl;
-                    std::cout << "  JA3      : " << tls_info.ja3() << std::endl;
-                    // Drop: false recycles the RX frame (true means "frame handed to TX" and would leak it)
-                    return false;
+                // JA3 flood control: too many ClientHellos with the same fingerprint on this worker
+                if (AETHON_UNLIKELY(res.session && ja3.should_block(tls_info.ja3_str, iph->saddr, now_ns))) {
+                    stats::count(stats::Event::Ja3RateLimited);
+                    res.session->client_hello_buf.clear();
+                    tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    return net::PacketInjector::ipv4_send_tcp_rst(
+                        sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                 }
                 if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
                     std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
@@ -568,6 +583,7 @@ namespace pipeline {
                         res.session->client_hello_buf.clear();
                     }
                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    stats::count(stats::Event::RstSniBlocked);
                     return net::PacketInjector::ipv4_send_tcp_rst(
                         sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                 }
@@ -634,6 +650,7 @@ namespace pipeline {
                             std::cout << ":" << ntohs(tcph->dest) << std::endl;
 
                             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            stats::count(stats::Event::RstDpiMatch);
                             return net::PacketInjector::ipv4_send_tcp_rst(
                                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                         }else{
@@ -647,6 +664,7 @@ namespace pipeline {
                                 //  Protect against unbounded memory growth in backend_tx_buf (CWE-400 / CWE-770)
                                 if (AETHON_UNLIKELY(!res.session->forward_to_backend(plain_buf, plain_len, target_port))) {
                                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                                    stats::count(stats::Event::RstBackendFailed);
                                     return net::PacketInjector::ipv4_send_tcp_rst(
                                         sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                                 }
@@ -677,6 +695,7 @@ namespace pipeline {
                     if (AETHON_UNLIKELY(res.session->tls_conn.status() == tls::TlsSessionStatus::ERROR_STATE)) {
                         // Undecryptable stream (bad MAC, protocol error): abort instead of stalling
                         tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                        stats::count(stats::Event::RstTlsError);
                         return net::PacketInjector::ipv4_send_tcp_rst(
                             sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                     }
@@ -707,6 +726,7 @@ namespace pipeline {
                         res.session->client_hello_buf.clear();
                     }
                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    stats::count(stats::Event::RstDpiMatch);
                     return net::PacketInjector::ipv4_send_tcp_rst(
                         sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                 }else{
@@ -722,6 +742,7 @@ namespace pipeline {
                         if (AETHON_UNLIKELY(!res.session->forward_to_backend(hello_data, hello_len, target_port))) {
                             res.session->client_hello_buf.clear();
                             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            stats::count(stats::Event::RstBackendFailed);
                             return net::PacketInjector::ipv4_send_tcp_rst(
                                 sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                         }
@@ -806,6 +827,7 @@ namespace pipeline {
                     uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
                     if (now_ns - session->last_tx_time_ns > rto_ns) {
                         if (session->retransmit_count >= MAX_TCP_RETRIES) {
+                            stats::count(stats::Event::SessionRtoGiveUp);
                             // Max retries exceeded: remote client is dead, close session
                             tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                         } else {
@@ -822,6 +844,7 @@ namespace pipeline {
                     uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
                     if (now_ns - session->last_tx_time_ns > rto_ns) {
                         if (session->retransmit_count >= MAX_TCP_RETRIES) {
+                            stats::count(stats::Event::SessionRtoGiveUp);
                             // Max retries exceeded: client is dead, close session
                             tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                         } else if (!tx_pool.empty()) {

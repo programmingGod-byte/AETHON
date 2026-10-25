@@ -88,13 +88,15 @@ Responses from the backend are read through epoll, encrypted if the session is T
 - Reassembly of out-of-order data in a 64 KB ring buffer with a byte-level bitmap.
 - **Overlap evasion detection:** a retransmission whose bytes disagree with data already buffered kills the session (Ptacek & Newsham, 1998).
 - Duplicate ACKs on reordering, flow control in both directions with real window advertisement and backpressure to and from the backend, window updates.
+- TCP checksum verification: corrupted segments are dropped and retransmitted, as in the kernel.
+- SYN cookies (SipHash-2-4) once a worker's session table is a quarter full, so spoofed SYN floods allocate nothing.
 - RFC 6298 retransmission timer (SRTT/RTTVAR, Karn's rule, exponential backoff), Reno congestion control (RFC 5681) with fast retransmit, go-back-N on timeout.
 - Graceful close in both directions, half-close (client FIN while the response is still being sent), FIN retransmission, RST handling, challenge ACKs for in-window SYNs (RFC 5961), RST/ACK for packets of unknown sessions.
 
 ### TLS
 - ClientHello reassembly across segments (large post-quantum ClientHellos from modern browsers).
 - SNI policy: domains listed in `rules/blocked_domains.txt`, and their subdomains, are reset.
-- JA3 fingerprint extraction from the ClientHello. A per-fingerprint rate limiter exists in `tcp_pipeline.h` but is commented out (see Known limitations).
+- JA3 fingerprinting with a per-worker rate limiter: too many ClientHellos sharing one fingerprint are dropped (coarse TLS flood control).
 - TLS termination through OpenSSL memory BIOs, routed to a backend by SNI or by destination IP:port.
 
 ### Deep packet inspection
@@ -162,7 +164,8 @@ Backends must listen on **127.0.0.1**. If they listen on `0.0.0.0`, clients can 
 | `build/src/test_tcp_fuzz [seeds] [bytes]` | no | Randomized reassembly under loss, reordering, duplicates, stale replays, out-of-window junk and tiny segments; the output stream must match byte for byte |
 | `tests/web_app_test/test.sh` | yes | Real clients through Aethon → nginx → Node.js: pages, APIs, keep-alive, sha256 of 5 MB downloads and 20 MB uploads over HTTP and HTTPS, DPI (plain and inside TLS), SNI blocking, bypass check; `--netem` adds delay and loss, `--load` runs wrk |
 | `tests/web_app_test/torture.sh` | yes | Network chaos in both directions (reorder, duplicates, jitter, burst loss, corruption, bandwidth caps), concurrency, connection churn with a leak check, protocol edge cases, adversarial clients (split-payload evasion, slowloris, aborted transfers, handshake floods, SYN floods) |
-| `tests/run_tests.sh` | yes | Older raw-packet scenarios: floods, fragmentation attacks, RST injection, JA3 rate limiting (option 16 needs the JA3 limiter re-enabled) |
+| `build/src/test_ja3_ratelimit` | no | Per-worker JA3 rate limiter: window, per-fingerprint counting, bounded memory, parallel safety |
+| `tests/run_tests.sh` | yes | Older raw-packet scenarios: floods, fragmentation attacks, RST injection, JA3 rate limiting |
 
 ```bash
 cmake --build build -j && ./build/src/test_tcp_reassembly && ./build/src/test_tcp_fuzz
@@ -171,6 +174,8 @@ cd tests/web_app_test && ./start.sh        # then start Aethon, then:
 ```
 
 Step-by-step instructions: [`tests/web_app_test/test.txt`](tests/web_app_test/test.txt).
+
+While running, Aethon prints an `[Events]` line whenever its reset/drop counters change (for example `rst_dpi_match`, `rst_no_session`, `tcp_bad_checksum`, `syn_cookie_sent`), and a summary at shutdown, so a failed test can be traced to the reason a connection ended.
 
 ## Measured results
 
@@ -191,13 +196,12 @@ The nginx-direct baseline ran wrk on the host competing with nginx for the same 
 Being explicit about these is part of the project.
 
 - **IPv4 only.** IPv6 is passed to the kernel uninspected.
-- **TCP checksums are not verified**, only the IPv4 header checksum. Corrupted segments can reach the backend.
 - **No window scaling or SACK.** At most 64 KB in flight, so throughput over long, lossy paths is far below Linux.
-- **No SYN cookies.** A spoofed SYN flood can fill the session table.
-- **Established sessions expire after 30 s idle**, shorter than typical browser and nginx keep-alive timeouts.
+- **Uploads can stall under very heavy loss** (10% in both directions in the torture suite) until the backend times out; the cause is still being investigated.
+- **Idle sessions expire after 120 s** without a FIN or RST to the client; backends with shorter keep-alive timeouts (nginx: 65 s) close them cleanly first.
 - **No global memory budget.** Per-session buffers are capped, but a slow-read attack across many connections can still exhaust memory.
 - **Flows must stay on one RX queue.** Sessions live in per-worker tables; real NICs guarantee this through RSS, while multi-queue veth setups need `net.core.txrehash=0` on the client.
-- **JA3 rate limiting is disabled** (commented out, kept for later). Before re-enabling it: its table is shared between worker threads without locking, the limit is global per fingerprint (all clients of one TLS library share a JA3), and each entry holds a 256 KB array.
+- **JA3 rate limiting is per worker**, not global: with N NIC queues one fingerprint can reach up to N x the limit across all source IPs before being throttled. All clients of one TLS library share a fingerprint, so set the limit well above normal demand.
 - **The XDP rate limiter and IP blocklist are implemented but disabled** in the BPF program.
 - **TLS handshakes and logging run on the packet threads**, so handshake floods and log floods slow down packet processing.
 - **ICMP is handled in userspace** (echo only); other ICMP types are dropped, which can break path MTU discovery.
@@ -221,7 +225,7 @@ docs/                   design notes and the project website
 
 ## Roadmap
 
-1. TCP checksum verification, SYN cookies, longer idle timeout with keep-alive handling.
+1. Find the remaining stall of uploads under 10% bidirectional loss (see the `[Events]` counters).
 2. Global memory budget with backpressure, fail-open (detach XDP if the process dies).
 3. Asynchronous logging: per-worker lock-free rings, a logger thread, rate-limited events.
 4. Window scaling and SACK.

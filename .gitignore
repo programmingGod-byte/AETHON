@@ -12,3 +12,6 @@ __pycache__/
 *.bin
 captured_rst.*
 
+
+# Hyperscan compiled-rule cache (generated at runtime)
+rules/.hs_cache/
