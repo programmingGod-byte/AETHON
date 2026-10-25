@@ -115,7 +115,7 @@ sudo apt install -y build-essential cmake clang llvm pkg-config \
 
 ### Build
 ```bash
-git clone https://github.com/programmingGod-byte/Intrusion_Detection.git aethon
+git clone https://github.com/programmingGod-byte/AETHON.git aethon
 cd aethon
 ./build.sh --release          # or: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```

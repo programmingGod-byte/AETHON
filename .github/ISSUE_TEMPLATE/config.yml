@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Report a security vulnerability
-    url: https://github.com/programmingGod-byte/Intrusion_Detection/security/advisories/new
+    url: https://github.com/programmingGod-byte/AETHON/security/advisories/new
     about: Please report vulnerabilities privately, never in a public issue.
   - name: Testing guide
-    url: https://github.com/programmingGod-byte/Intrusion_Detection/blob/main/tests/web_app_test/test.txt
+    url: https://github.com/programmingGod-byte/AETHON/blob/main/tests/web_app_test/test.txt
     about: How to build, run and test Aethon on a virtual network before filing a bug.
