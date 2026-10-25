@@ -28,11 +28,27 @@
 #include "tls_engine.h"
 #include "tls_parser.h"
 #include "domain_blocklist.h"
+#include "aethon/single_thread_hasmap.h"
+#include <chrono>
 #include "service_registry.h"
 
 namespace aethon {
 namespace pipeline {
-
+    static constexpr size_t MAX_JA3_IPS = 65536;
+    struct rate_lim_ja3{
+        uint16_t tokens{0};
+        uint64_t last_updated{0};
+        uint16_t limit{10};
+        uint64_t window{10};
+    };
+    struct ja3_ips{
+        uint32_t ips[MAX_JA3_IPS]{};
+        struct rate_lim_ja3 rate_lim{};
+        int offset{0};
+    };
+    using JA3_map = aethon::SingleThreadHashMap<aethon::tls::JA3, struct ja3_ips>;
+    inline JA3_map g_ja3_map{1024};
+    inline JA3_map* ja3_map{&g_ja3_map};
     AETHON_ALWAYS_INLINE void print_ip(uint32_t ip) noexcept {
         char buf[INET_ADDRSTRLEN];
         struct in_addr addr;
@@ -89,8 +105,45 @@ namespace pipeline {
 
         if (AETHON_LIKELY(res.is_ready && res.payload_len > 0)) {
             auto tls_info = tls::parse_client_hello(res.payload, res.payload_len);
-
+            bool exceed = false;
             if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(tls_info.is_client_hello, 1, 0.02)) {
+                if (ja3_map && tls_info.ja3_str.curr_id > 0) {
+                    auto *value = ja3_map->find(tls_info.ja3_str);
+                    if (AETHON_UNLIKELY(value)) {
+                        if (AETHON_LIKELY(value->offset < static_cast<int>(MAX_JA3_IPS))) {
+                            value->ips[value->offset++] = iph->saddr;
+                        }
+                        const uint64_t window_ns = value->rate_lim.window * 1000000000ULL;
+                        if (now_ns - value->rate_lim.last_updated > window_ns) {
+                            value->rate_lim.last_updated = now_ns;
+                            value->rate_lim.tokens = 1;
+                        } else {
+                            if (AETHON_UNLIKELY(value->rate_lim.tokens + 1 > value->rate_lim.limit)) {
+                                exceed = true;
+                                value->rate_lim.last_updated = now_ns;
+                                value->rate_lim.tokens = 0;
+                            } else {
+                                value->rate_lim.tokens++;
+                            }
+                        }
+                    } else {
+                        struct ja3_ips new_ip_list{};
+                        new_ip_list.ips[new_ip_list.offset++] = iph->saddr;
+                        new_ip_list.rate_lim.tokens = 1;
+                        new_ip_list.rate_lim.window = 10;
+                        new_ip_list.rate_lim.limit = 10;
+                        new_ip_list.rate_lim.last_updated = now_ns;
+                        ja3_map->insert(tls_info.ja3_str, new_ip_list);
+                    }
+                }
+                if (AETHON_UNLIKELY(exceed)) {
+                    std::cout << "\n[IPS RATE-LIMIT] JA3 Fingerprint Limit Exceeded! Dropping ClientHello." << std::endl;
+                    std::cout << "  Attacker : ";
+                    print_ip(iph->saddr);
+                    std::cout << ":" << ntohs(tcph->source) << std::endl;
+                    std::cout << "  JA3      : " << tls_info.ja3() << std::endl;
+                    return true;
+                }
                 if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
                     std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
                     std::cout << "  Attacker : ";
@@ -121,7 +174,6 @@ namespace pipeline {
                     std::memcpy(res.session->server_mac, eth->ether_dhost, 6);
                 }
             }
-
             if (res.session && res.session->tls_conn.status() != tls::TlsSessionStatus::IDLE) {
                 res.session->tls_conn.feed_network_data(res.payload, res.payload_len);
 

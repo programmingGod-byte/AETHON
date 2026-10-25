@@ -12,14 +12,24 @@
 namespace aethon {
 
 template <typename T> struct SingleThreadDefaultHash {
-  AETHON_ALWAYS_INLINE size_t operator()(T key) const noexcept {
-    uint64_t x = static_cast<uint64_t>(key);
-    x ^= x >> 30;
-    x *= 0xbf58476d1ce4e5b9ULL;
-    x ^= x >> 27;
-    x *= 0x94d049bb133111ebULL;
-    x ^= x >> 31;
-    return static_cast<size_t>(x);
+  AETHON_ALWAYS_INLINE size_t operator()(const T &key) const noexcept {
+    if constexpr (std::is_integral_v<T> || std::is_enum_v<T> || std::is_pointer_v<T>) {
+      uint64_t x = static_cast<uint64_t>(key);
+      x ^= x >> 30;
+      x *= 0xbf58476d1ce4e5b9ULL;
+      x ^= x >> 27;
+      x *= 0x94d049bb133111ebULL;
+      x ^= x >> 31;
+      return static_cast<size_t>(x);
+    } else {
+      uint64_t hash = 14695981039346656037ULL;
+      const auto *bytes = reinterpret_cast<const uint8_t *>(&key);
+      for (size_t i = 0; i < sizeof(T); ++i) {
+        hash ^= static_cast<uint64_t>(bytes[i]);
+        hash *= 1099511628211ULL;
+      }
+      return static_cast<size_t>(hash);
+    }
   }
 };
 
