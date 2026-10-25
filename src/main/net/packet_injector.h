@@ -357,7 +357,8 @@ public:
         uint32_t server_isn,
         uint32_t client_seq
     ) noexcept {
-        constexpr size_t total_synack_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr);
+        constexpr size_t tcp_opt_len = 4;
+        constexpr size_t total_synack_len = sizeof(struct ether_header) + sizeof(struct iphdr) + sizeof(struct tcphdr) + tcp_opt_len;
         AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
 
         uint8_t client_mac[ETH_ALEN];
@@ -379,7 +380,7 @@ public:
         out_iph->ihl = 5;
         out_iph->version = 4;
         out_iph->tos = 0;
-        out_iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));
+        out_iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + tcp_opt_len);
         out_iph->id = htons(0x1337);
         out_iph->frag_off = 0;
         out_iph->ttl = 64;
@@ -397,10 +398,17 @@ public:
         out_tcph->ack_seq = htonl(client_seq + 1);
         out_tcph->syn = 1;
         out_tcph->ack = 1;
-        out_tcph->doff = 5;
+        out_tcph->doff = 6;
         out_tcph->window = htons(65535);
+
+        uint8_t *opts = reinterpret_cast<uint8_t *>(out_tcph + 1);
+        opts[0] = 0x02;
+        opts[1] = 0x04;
+        opts[2] = 0x05;
+        opts[3] = 0xb4;
+
         out_tcph->check = 0;
-        out_tcph->check = htons(ipv4_tcp_compute_checksum(out_iph->saddr, out_iph->daddr, out_tcph, sizeof(struct tcphdr)));
+        out_tcph->check = htons(ipv4_tcp_compute_checksum(out_iph->saddr, out_iph->daddr, out_tcph, sizeof(struct tcphdr) + tcp_opt_len));
 
         uint32_t idx = 0;
         if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(xsk_ring_prod__reserve(&sock->tx, 1, &idx) != 1, 0, 0.001)) {

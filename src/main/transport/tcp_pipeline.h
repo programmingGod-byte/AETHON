@@ -510,10 +510,17 @@ namespace pipeline {
                     res.session->tls_conn.step_handshake();
                     uint8_t tx_buf[20480];
                     int tx_len;
+                    bool sent_handshake_data = false;
                     while ((tx_len = res.session->tls_conn.read_pending_tx(tx_buf, sizeof(tx_buf))) > 0) {
                         send_tcp_segmented_data(sock, res.session, tx_buf, static_cast<size_t>(tx_len), tx_pool);
+                        sent_handshake_data = true;
                     }
                     if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
+                        // Partial handshake flight: ACK it so the client doesn't wait for an RTO
+                        if (!sent_handshake_data) {
+                            return net::PacketInjector::ipv4_send_tcp_ack(
+                                sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
+                        }
                         return false;
                     }
                 }
@@ -579,10 +586,18 @@ namespace pipeline {
                         }
                     }
 
-                    if (any_decrypted) {
-                        return net::PacketInjector::ipv4_send_tcp_ack(
-                            sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
+                    (void)any_decrypted;
+                    if (AETHON_UNLIKELY(res.session->tls_conn.status() == tls::TlsSessionStatus::ERROR_STATE)) {
+                        // Undecryptable stream (bad MAC, protocol error): abort instead of stalling
+                        tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                        return net::PacketInjector::ipv4_send_tcp_rst(
+                            sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                     }
+                    // ACK every in-order segment, not only those that complete a TLS record:
+                    // a 16 KB record spans ~12 segments, more than the client's initial cwnd,
+                    // so waiting for a full record makes the client stall until its RTO.
+                    return net::PacketInjector::ipv4_send_tcp_ack(
+                        sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
                 }
             } else {
                 if (AETHON_UNLIKELY(res.session && !res.session->hs_stream)) {

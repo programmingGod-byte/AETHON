@@ -255,7 +255,8 @@ namespace aethon {
             TcpKey key{KemptyTcpKey};
             TcpState state{TcpState::CLOSED};
             uint8_t _pad0{0};
-            uint16_t out_of_order_count{0}; // how many out of out packet sitting in the ring buffer
+            uint16_t _pad1{0};
+            uint32_t ooo_bytes{0};          // exact number of bytes buffered in the ring ahead of rcv_nxt
             uint32_t isn{0};
             uint32_t server_isn{0};         // RFC 6528: Server Initial Sequence Number (randomized)
             uint32_t rcv_nxt{0};
@@ -327,7 +328,9 @@ namespace aethon {
 
 
             AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
-                size_t used = backend_tx_buf.size();
+                // Undecrypted TLS bytes are already ACKed but not yet in backend_tx_buf; count them,
+                // otherwise a burst of completed records can overflow MAX_BACKEND_BUF (-> RST)
+                size_t used = backend_tx_buf.size() + tls_conn.pending_input();
                 if (used >= MAX_BACKEND_BUF) return 0;
                 size_t remaining = MAX_BACKEND_BUF - used;
                 return static_cast<uint16_t>(std::min<size_t>(65535, remaining));
@@ -506,8 +509,10 @@ namespace aethon {
             }
 
             
-            AETHON_ALWAYS_INLINE void set_bitmap_range(size_t start, size_t count) noexcept{
+            // Returns how many bits were newly set (bytes not buffered before)
+            AETHON_ALWAYS_INLINE size_t set_bitmap_range(size_t start, size_t count) noexcept{
                 start&=0xFFFF;
+                size_t newly_set = 0;
                 while (count>0) {
                     size_t word_idx = start >> 6; // divide by 64
                     size_t bit_offset = start & 63; // % 64
@@ -516,25 +521,31 @@ namespace aethon {
 
                     size_t n = (count < bits_in_word) ? count : bits_in_word;
 
-                    uint64_t mask = (n == 64) ? ~0ULL : ((1ULL << n) - 1ULL);
-                    bitmap[word_idx]|= (mask << bit_offset);
+                    uint64_t mask = ((n == 64) ? ~0ULL : ((1ULL << n) - 1ULL)) << bit_offset;
+                    newly_set += static_cast<size_t>(__builtin_popcountll(mask & ~bitmap[word_idx]));
+                    bitmap[word_idx]|= mask;
                     start = (start + n) & 0xFFFF;
                     count-=n;
                 }
+                return newly_set;
             }
 
-              AETHON_ALWAYS_INLINE void clear_bitmap_range(size_t start, size_t count) noexcept {
+              // Returns how many bits were actually cleared (bytes that were buffered)
+              AETHON_ALWAYS_INLINE size_t clear_bitmap_range(size_t start, size_t count) noexcept {
                 start &= 0xFFFF;
+                size_t cleared = 0;
                 while (count > 0) {
                     size_t word_idx = start >> 6;
                     size_t bit_offset = start & 63;
                     size_t bits_in_word = 64 - bit_offset;
                     size_t n = (count < bits_in_word) ? count : bits_in_word;
-                    uint64_t mask = (n == 64) ? ~0ULL : ((1ULL << n) - 1ULL);
-                    bitmap[word_idx] &= ~(mask << bit_offset);
+                    uint64_t mask = ((n == 64) ? ~0ULL : ((1ULL << n) - 1ULL)) << bit_offset;
+                    cleared += static_cast<size_t>(__builtin_popcountll(mask & bitmap[word_idx]));
+                    bitmap[word_idx] &= ~mask;
                     start = (start + n) & 0xFFFF;
                     count -= n;
                 }
+                return cleared;
             }
 
             // Overlap evasion check: true if any byte that is ALREADY buffered (bitmap bit set)
@@ -887,9 +898,9 @@ namespace aethon {
                         cur_seq       = session->rcv_nxt;
                     }
 
-                    // In-order packet (packet matches rcv_nxt AND there are no out-of-order packets waiting)
+                    // In-order packet (packet matches rcv_nxt AND no out-of-order bytes are buffered)
 
-                    if(AETHON_LIKELY(cur_seq == session->rcv_nxt && session->out_of_order_count ==0)){
+                    if(AETHON_LIKELY(cur_seq == session->rcv_nxt && session->ooo_bytes == 0)){
                         result.payload     = cur_payload;
                         result.payload_len = cur_len;
                         result.is_ready    = true;
@@ -906,8 +917,7 @@ namespace aethon {
                                 return result;
                             }
                             session->write_ring_buffer(cur_seq, cur_payload, cur_len);
-                            session->set_bitmap_range(cur_seq, cur_len);
-                            session->out_of_order_count++;
+                            session->ooo_bytes += static_cast<uint32_t>(session->set_bitmap_range(cur_seq, cur_len));
                             // Duplicate ACK for rcv_nxt: lets the client fast-retransmit the missing segment
                             result.need_ack = true;
                         }
@@ -924,7 +934,7 @@ namespace aethon {
                                 return result;
                             }
                             session->write_ring_buffer(cur_seq, cur_payload, cur_len);
-                            session->set_bitmap_range(cur_seq, cur_len);
+                            session->ooo_bytes += static_cast<uint32_t>(session->set_bitmap_range(cur_seq, cur_len));
 
                             // drain all continuous bytes starting at rcv_next
                             size_t contiguous = session->count_continuous_bytes(session->rcv_nxt, AETHON_TCP_WINDOW_SIZE);
@@ -932,17 +942,13 @@ namespace aethon {
                             if(AETHON_LIKELY(contiguous >0 )){
 
                                 session->read_ring_buffer(session->rcv_nxt, drain_buf_.data(), contiguous);
-                                session->clear_bitmap_range(session->rcv_nxt, contiguous);
+                                session->ooo_bytes -= static_cast<uint32_t>(session->clear_bitmap_range(session->rcv_nxt, contiguous));
 
                                 session->rcv_nxt += contiguous;
 
                                 result.payload = drain_buf_.data();
                                 result.payload_len = contiguous;
                                 result.is_ready = true;
-
-                                if(session->out_of_order_count > 0){
-                                    session->out_of_order_count --;
-                                }
                             }
                         }
                     }

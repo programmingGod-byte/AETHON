@@ -73,6 +73,11 @@ namespace aethon::tls {
             AETHON_ALWAYS_INLINE bool is_established() const noexcept {
                 return status_ == TlsSessionStatus::ESTABLISHED;
             }
+
+            // Ciphertext received from the network but not yet decrypted (partial TLS records)
+            AETHON_ALWAYS_INLINE size_t pending_input() const noexcept {
+                return in_bio_ ? BIO_ctrl_pending(in_bio_) : 0;
+            }
             
 
             bool init(SSL_CTX * ctx) noexcept {

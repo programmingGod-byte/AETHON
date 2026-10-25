@@ -150,3 +150,7 @@ TROUBLESHOOTING
                                          is XDP attached? (ip link show veth0 | grep xdp)
   TLS tests skipped                   -> 192.168.50.1:443 line missing in rules/services.conf
   stuck XDP after a crash             -> sudo ip link set dev veth0 xdp off
+  uploads reset under loss / TLS      -> a flow switched RX queue after an RTO (veth artifact):
+                                           sudo ip netns exec client_ns sysctl -w net.core.txrehash=0
+                                         (start.sh does this; needed again after veth0.bash recreates client_ns)
+                                         check queue spread: ethtool -S veth0 | grep -E 'rx_queue_[0-9]+_packets'

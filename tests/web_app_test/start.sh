@@ -36,6 +36,13 @@ info "disabling offloads (TSO/GSO/GRO create frames larger than a 2 KB UMEM fram
 sudo ethtool -K veth0 gro off gso off tso off tx off >/dev/null 2>&1 || true
 sudo ip netns exec client_ns ethtool -K veth1 gro off gso off tso off tx off >/dev/null 2>&1 || true
 
+# On veth the RX queue on veth0 = the client's TX queue. After a retransmission timeout Linux
+# re-hashes the flow (net.core.txrehash), so it can jump to another TX queue -> another Aethon
+# worker that has no session for it -> RST. A real NIC's RSS hashes the 4-tuple on the receiver,
+# so a flow always stays on one queue; disable re-hashing in the client to behave the same.
+info "disabling TX re-hashing in client_ns (keeps each flow on one queue, like NIC RSS)"
+sudo ip netns exec client_ns sysctl -qw net.core.txrehash=0 || true
+
 # 2. Runtime directories and large test files with known checksums
 mkdir -p "$RUN_DIR"/{logs,files,tmp}
 for mb in 1 5 50; do

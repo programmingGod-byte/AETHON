@@ -67,9 +67,14 @@ private:
     uint64_t now_{1'000'000'000ULL};
 };
 
+// Pseudo-random bytes (non-periodic, so data 64 KB apart differs like a real stream)
 static std::vector<uint8_t> pattern(size_t n, uint8_t seed) {
     std::vector<uint8_t> v(n);
-    for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(i * 7 + seed);
+    uint64_t x = 0x9E3779B97F4A7C15ULL ^ seed;
+    for (size_t i = 0; i < n; ++i) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        v[i] = static_cast<uint8_t>(x);
+    }
     return v;
 }
 
@@ -124,6 +129,35 @@ static void test_identical_duplicate_accepted() {
     CHECK(r.session != nullptr, "identical duplicate keeps the session alive");
 }
 
+// Two holes; the first filler only closes the first hole. Buffered data behind the second
+// hole must still be tracked: it must be delivered once the second hole is filled, and its
+// bitmap bits must not linger and cause a false "overlap attack" after the ring wraps.
+static void test_partial_fill_keeps_tracking() {
+    std::puts("partial hole fill with more out-of-order data behind it");
+    auto data = pattern(300000, 11);
+    Conn c(40003);
+
+    c.send(data, 0, 536);                     // in order: rcv_nxt = 536
+    c.send(data, 1608, 536);                  // buffered, holes at [536,1072) and [1072,1608)
+    auto f1 = c.send(data, 536, 536);         // fills only the first hole
+    CHECK(f1.is_ready && f1.payload_len == 536, "first filler delivers only up to the second hole");
+
+    auto f2 = c.send(data, 1072, 536);        // fills the second hole
+    CHECK(f2.is_ready && f2.payload_len == 1072, "second filler also delivers the buffered segment");
+
+    // Like a real client: whatever the ACK didn't cover is retransmitted, then the stream goes on
+    uint32_t off = f2.is_ready ? 1072 + f2.payload_len : 1072;
+    bool alive = true;
+    while (off < 1608 + 65536 - 536 && alive) {   // in order until just before one ring length later
+        alive = c.send(data, off, 536).session != nullptr;
+        off += 536;
+    }
+    // Reordering exactly over the ring positions of [1608, 2144): B arrives before A
+    alive = alive && c.send(data, off + 536, 536).session != nullptr;     // B (out of order)
+    alive = alive && c.send(data, off, 536).session != nullptr;           // A (fills the hole)
+    CHECK(alive, "stream survives ring wrap-around after partial fills (no stale bitmap bits)");
+}
+
 static void test_domain_policy() {
     std::puts("SNI domain policy");
     aethon::dns::DomainBlocklist list;
@@ -144,6 +178,7 @@ int main() {
     test_resegmented_retransmission();
     test_conflicting_overlap_detected();
     test_identical_duplicate_accepted();
+    test_partial_fill_keeps_tracking();
     test_domain_policy();
 
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures,
