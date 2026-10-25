@@ -84,7 +84,7 @@ def send_client_hello(target_ip, src_ip, dst_port, src_port, payload):
     # 1. Send TCP SYN
     syn_pkt = build_packet(src_ip, target_ip, src_port, dst_port, init_seq, 0, 0x02, b"")
     sender.sendto(syn_pkt, (target_ip, 0))
-    time.sleep(0.005)
+    time.sleep(0.01)
 
     # 2. Send TCP PSH-ACK with TLS ClientHello payload
     data_pkt = build_packet(src_ip, target_ip, src_port, dst_port, init_seq + 1, 1, 0x18, payload)
@@ -94,70 +94,76 @@ def send_client_hello(target_ip, src_ip, dst_port, src_port, payload):
 def main():
     target_ip = sys.argv[1] if len(sys.argv) > 1 else "192.168.50.1"
     src_ip = sys.argv[2] if len(sys.argv) > 2 else "192.168.50.2"
-    iface = sys.argv[3] if len(sys.argv) > 3 else "veth0"
+    iface = sys.argv[3] if len(sys.argv) > 3 else "veth1"
     domain = sys.argv[4] if len(sys.argv) > 4 else "mydomain.com"
 
-    print("==========================================================")
-    print("      AETHON JA3 FINGERPRINT RATE LIMITING TEST           ")
-    print("==========================================================")
-    print(f"Target       : {target_ip}:443")
-    print(f"Source IP    : {src_ip}")
-    print(f"Interface    : {iface}")
-    print(f"Allowed SNI  : {domain}")
-    print(f"Rate Window  : 10 seconds")
-    print(f"Rate Limit   : 10 connections / JA3")
-    print("==========================================================")
+    # Drop kernel RSTs from disrupting raw TCP sessions inside namespace
+    os.system("iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP 2>/dev/null")
 
-    # JA3 Profile 1: Ciphers 0x1301, 0x1302, 0x1303 (e.g. Modern Chrome / Bot A)
-    ciphers_profile_1 = [0x1301, 0x1302, 0x1303]
-    ch_payload_1 = build_tls_client_hello(domain, ciphers_profile_1)
+    try:
+        print("==========================================================")
+        print("      AETHON JA3 FINGERPRINT RATE LIMITING TEST           ")
+        print("==========================================================")
+        print(f"Target       : {target_ip}:443")
+        print(f"Source IP    : {src_ip}")
+        print(f"Interface    : {iface}")
+        print(f"Allowed SNI  : {domain}")
+        print(f"Rate Window  : 10 seconds")
+        print(f"Rate Limit   : 10 connections / JA3")
+        print("==========================================================")
 
-    # JA3 Profile 2: Ciphers 0xC02F, 0xC030 (e.g. Legacy Client / Bot B)
-    ciphers_profile_2 = [0xC02F, 0xC030]
-    ch_payload_2 = build_tls_client_hello(domain, ciphers_profile_2)
+        # JA3 Profile 1: Ciphers 0x1301, 0x1302, 0x1303 (e.g. Modern Chrome / Bot A)
+        ciphers_profile_1 = [0x1301, 0x1302, 0x1303]
+        ch_payload_1 = build_tls_client_hello(domain, ciphers_profile_1)
 
-    base_port = 40000
+        # JA3 Profile 2: Ciphers 0xC02F, 0xC030 (e.g. Legacy Client / Bot B)
+        ciphers_profile_2 = [0xC02F, 0xC030]
+        ch_payload_2 = build_tls_client_hello(domain, ciphers_profile_2)
 
-    print("\n[PHASE 1] Sending 10 ClientHellos with JA3 Profile 1 (Within Quota)...")
-    for i in range(1, 11):
-        src_port = base_port + i
-        send_client_hello(target_ip, src_ip, 443, src_port, ch_payload_1)
-        print(f"  -> Packet {i}/10 sent (port {src_port}) - EXPECTED: ALLOWED")
-        time.sleep(0.05)
+        base_port = random.randint(30000, 50000)
 
-    print("\n[PHASE 2] Sending 5 MORE ClientHellos with JA3 Profile 1 (Exceeding Limit)...")
-    for i in range(11, 16):
-        src_port = base_port + i
-        send_client_hello(target_ip, src_ip, 443, src_port, ch_payload_1)
-        print(f"  -> Packet {i} sent (port {src_port}) - EXPECTED: DROPPED ([IPS RATE-LIMIT])")
-        time.sleep(0.05)
+        print("\n[PHASE 1] Sending 10 ClientHellos with JA3 Profile 1 (Within Quota)...")
+        for i in range(1, 11):
+            src_port = base_port + i
+            send_client_hello(target_ip, src_ip, 443, src_port, ch_payload_1)
+            print(f"  -> Packet {i}/10 sent (port {src_port}) - EXPECTED: ALLOWED")
+            time.sleep(0.05)
 
-    print("\n[PHASE 3] Testing Fingerprint Isolation (JA3 Profile 2)...")
-    print("  Sending ClientHello with DIFFERENT ciphers (distinct JA3 fingerprint)...")
-    src_port_diff = base_port + 99
-    send_client_hello(target_ip, src_ip, 443, src_port_diff, ch_payload_2)
-    print(f"  -> Packet sent (port {src_port_diff}) - EXPECTED: ALLOWED (Has separate token quota)")
+        print("\n[PHASE 2] Sending 5 MORE ClientHellos with JA3 Profile 1 (Exceeding Limit)...")
+        for i in range(11, 16):
+            src_port = base_port + i
+            send_client_hello(target_ip, src_ip, 443, src_port, ch_payload_1)
+            print(f"  -> Packet {i} sent (port {src_port}) - EXPECTED: DROPPED ([IPS RATE-LIMIT])")
+            time.sleep(0.05)
 
-    print("\n----------------------------------------------------------")
-    print("Check the Aethon afxdp_control console output:")
-    print("  - First 10 connections: Processed normally")
-    print("  - Next 5 connections: Dropped with '[IPS RATE-LIMIT]' alert")
-    print("  - Distinct JA3 connection: Allowed through")
-    print("----------------------------------------------------------")
+        print("\n[PHASE 3] Testing Fingerprint Isolation (JA3 Profile 2)...")
+        print("  Sending ClientHello with DIFFERENT ciphers (distinct JA3 fingerprint)...")
+        src_port_diff = base_port + 99
+        send_client_hello(target_ip, src_ip, 443, src_port_diff, ch_payload_2)
+        print(f"  -> Packet sent (port {src_port_diff}) - EXPECTED: ALLOWED (Has separate token quota)")
 
-    if "--wait-window" in sys.argv:
-        print("\n[PHASE 4] Waiting 10 seconds for rate limit window to expire...")
-        for remaining in range(10, 0, -1):
-            sys.stdout.write(f"\r  Cooldown: {remaining}s remaining... ")
-            sys.stdout.flush()
-            time.sleep(1)
-        print("\r  Cooldown complete!                             ")
+        print("\n----------------------------------------------------------")
+        print("Check the Aethon afxdp_control console output:")
+        print("  - First 10 connections: Processed normally")
+        print("  - Next 5 connections: Dropped with '[IPS RATE-LIMIT]' alert")
+        print("  - Distinct JA3 connection: Allowed through")
+        print("----------------------------------------------------------")
 
-        src_port_reset = base_port + 200
-        send_client_hello(target_ip, src_ip, 443, src_port_reset, ch_payload_1)
-        print(f"  -> Sent ClientHello (port {src_port_reset}) after window reset - EXPECTED: ALLOWED")
+        if "--wait-window" in sys.argv:
+            print("\n[PHASE 4] Waiting 10 seconds for rate limit window to expire...")
+            for remaining in range(10, 0, -1):
+                sys.stdout.write(f"\r  Cooldown: {remaining}s remaining... ")
+                sys.stdout.flush()
+                time.sleep(1)
+            print("\r  Cooldown complete!                             ")
 
-    print("\n[+] Test complete.")
+            src_port_reset = base_port + 200
+            send_client_hello(target_ip, src_ip, 443, src_port_reset, ch_payload_1)
+            print(f"  -> Sent ClientHello (port {src_port_reset}) after window reset - EXPECTED: ALLOWED")
+
+        print("\n[+] Test complete.")
+    finally:
+        os.system("iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP 2>/dev/null")
 
 if __name__ == "__main__":
     main()

@@ -33,21 +33,52 @@
 #include "domain_blocklist.h"
 #include "aethon/single_thread_hasmap.h"
 #include <chrono>
+#include <atomic>
 #include "service_registry.h"
 
 namespace aethon {
 namespace pipeline {
     static constexpr size_t MAX_JA3_IPS = 65536;
     struct rate_lim_ja3{
-        uint16_t tokens{0};
-        uint64_t last_updated{0};
+        std::atomic<uint16_t> tokens{0};
+        std::atomic<uint64_t> last_updated{0};
         uint16_t limit{10};
         uint64_t window{10};
+
+        rate_lim_ja3() = default;
+        rate_lim_ja3(const rate_lim_ja3 &o) noexcept
+            : tokens(o.tokens.load(std::memory_order_relaxed)),
+              last_updated(o.last_updated.load(std::memory_order_relaxed)),
+              limit(o.limit), window(o.window) {}
+        rate_lim_ja3 &operator=(const rate_lim_ja3 &o) noexcept {
+            if (this != &o) {
+                tokens.store(o.tokens.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                last_updated.store(o.last_updated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                limit = o.limit;
+                window = o.window;
+            }
+            return *this;
+        }
     };
     struct ja3_ips{
         uint32_t ips[MAX_JA3_IPS]{};
         struct rate_lim_ja3 rate_lim{};
-        int offset{0};
+        std::atomic<int> offset{0};
+
+        ja3_ips() = default;
+        ja3_ips(const ja3_ips &o) noexcept
+            : rate_lim(o.rate_lim),
+              offset(o.offset.load(std::memory_order_relaxed)) {
+            std::memcpy(ips, o.ips, sizeof(ips));
+        }
+        ja3_ips &operator=(const ja3_ips &o) noexcept {
+            if (this != &o) {
+                std::memcpy(ips, o.ips, sizeof(ips));
+                rate_lim = o.rate_lim;
+                offset.store(o.offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+            return *this;
+        }
     };
     using JA3_map = aethon::SingleThreadHashMap<aethon::tls::JA3, struct ja3_ips>;
     inline JA3_map g_ja3_map{1024};
@@ -356,29 +387,33 @@ namespace pipeline {
                 if (ja3_map && tls_info.ja3_str.curr_id > 0) {
                     auto *value = ja3_map->find(tls_info.ja3_str);
                     if (AETHON_UNLIKELY(value)) {
-                        if (AETHON_LIKELY(value->offset < static_cast<int>(MAX_JA3_IPS))) {
-                            value->ips[value->offset++] = iph->saddr;
+                        int off = value->offset.fetch_add(1, std::memory_order_relaxed);
+                        if (AETHON_LIKELY(off < static_cast<int>(MAX_JA3_IPS))) {
+                            value->ips[off] = iph->saddr;
                         }
                         const uint64_t window_ns = value->rate_lim.window * 1000000000ULL;
-                        if (now_ns - value->rate_lim.last_updated > window_ns) {
-                            value->rate_lim.last_updated = now_ns;
-                            value->rate_lim.tokens = 1;
-                        } else {
-                            if (AETHON_UNLIKELY(value->rate_lim.tokens + 1 > value->rate_lim.limit)) {
-                                exceed = true;
-                                value->rate_lim.last_updated = now_ns;
-                                value->rate_lim.tokens = 0;
+                        uint64_t last = value->rate_lim.last_updated.load(std::memory_order_relaxed);
+                        if (now_ns - last > window_ns) {
+                            if (value->rate_lim.last_updated.compare_exchange_strong(last, now_ns, std::memory_order_relaxed)) {
+                                value->rate_lim.tokens.store(1, std::memory_order_relaxed);
                             } else {
-                                value->rate_lim.tokens++;
+                                if (value->rate_lim.tokens.fetch_add(1, std::memory_order_relaxed) >= value->rate_lim.limit) {
+                                    exceed = true;
+                                }
+                            }
+                        } else {
+                            if (value->rate_lim.tokens.fetch_add(1, std::memory_order_relaxed) >= value->rate_lim.limit) {
+                                exceed = true;
                             }
                         }
                     } else {
                         struct ja3_ips new_ip_list{};
-                        new_ip_list.ips[new_ip_list.offset++] = iph->saddr;
-                        new_ip_list.rate_lim.tokens = 1;
+                        int off = new_ip_list.offset.fetch_add(1, std::memory_order_relaxed);
+                        new_ip_list.ips[off] = iph->saddr;
+                        new_ip_list.rate_lim.tokens.store(1, std::memory_order_relaxed);
                         new_ip_list.rate_lim.window = 10;
                         new_ip_list.rate_lim.limit = 10;
-                        new_ip_list.rate_lim.last_updated = now_ns;
+                        new_ip_list.rate_lim.last_updated.store(now_ns, std::memory_order_relaxed);
                         ja3_map->insert(tls_info.ja3_str, new_ip_list);
                     }
                 }
