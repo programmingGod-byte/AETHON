@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <iostream>
 #include <sys/types.h>
+#include <random>
 #include "tls_engine.h"
 #include "tls_parser.h"
 #include "domain_blocklist.h"
@@ -44,6 +45,18 @@ namespace pipeline {
         } else {
             std::cout << "unknown";
         }
+    }
+
+    AETHON_ALWAYS_INLINE static uint32_t generate_random_isn() noexcept {
+        // RFC 6528 / RFC 9293: Cryptographically unpredictable Initial Sequence Number
+        // Defends against off-path blind TCP injection, connection spoofing, and RST attacks.
+        thread_local std::mt19937_64 rng([]() {
+            std::random_device rd;
+            return (static_cast<uint64_t>(rd()) << 32) ^ rd() ^
+                   static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        }());
+        uint32_t val = static_cast<uint32_t>(rng());
+        return (val == 0) ? 1 : val; // Ensure non-zero ISN
     }
 
     inline dns::DomainBlocklist g_domain_blocklist;
@@ -100,11 +113,17 @@ namespace pipeline {
                 session->snd_buf.data() + sent_offset, chunk_len, // <-- data from snd_buf!
                 session->recv_window());
             if (AETHON_LIKELY(sent)) {
+                uint64_t tx_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                // Karn's algorithm: sample RTT on outbound data when not retransmitting
+                if (session->rtt_time_ns == 0 && session->retransmit_count == 0) {
+                    session->rtt_seq = session->send_nxt + chunk_len;
+                    session->rtt_time_ns = tx_now_ns;
+                }
                 session->send_nxt += chunk_len;
                 sent_offset += chunk_len;
                 // Record timestamp for RTO timer:
-                session->last_tx_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                session->last_tx_time_ns = tx_now_ns;
             } else {
                 tx_pool.push_back(tx_buf_addr);
                 break;
@@ -119,7 +138,9 @@ namespace pipeline {
     AETHON_ALWAYS_INLINE bool retransmit_unacked_data(
         xdp::aethon_xsk_socket_info * __restrict__ sock,
         IPv4TcpAssembler::TcpStreamSession * __restrict__ session,
-        std::vector<uint64_t> &tx_pool
+        std::vector<uint64_t> &tx_pool,
+        size_t max_packets = 10,
+        bool is_rto = true
     ) noexcept {
         if (!sock || !session || session->snd_buf.empty() || tx_pool.empty()) {
             return false;
@@ -129,35 +150,52 @@ namespace pipeline {
         size_t in_flight = session->send_nxt - session->snd_una;
         if (in_flight == 0) return false;
 
-        // Oldest unacknowledged segment is located at index 0 of snd_buf
-        size_t chunk_len = std::min(std::min(in_flight, session->snd_buf.size()), AETHON_MSS);
-        uint64_t tx_buf_addr = tx_pool.back();
-        tx_pool.pop_back();
+        // Issue #9: Go-Back-N burst retransmission of up to max_packets (default 10) segments
+        size_t to_retransmit = std::min({in_flight, session->snd_buf.size(), max_packets * AETHON_MSS});
+        size_t retrans_offset = 0;
+        uint32_t packets_sent = 0;
 
-        uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
-        AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
+        while (retrans_offset < to_retransmit && !tx_pool.empty()) {
+            size_t chunk_len = std::min(to_retransmit - retrans_offset, AETHON_MSS);
+            uint64_t tx_buf_addr = tx_pool.back();
+            tx_pool.pop_back();
 
-        // Retransmit starting from snd_una
-        bool sent = net::PacketInjector::ipv4_send_tcp_data(
-            sock, tx_buf_addr, pkt,
-            session->client_mac, session->server_mac,
-            session->key.src_ip, session->key.dst_ip,
-            session->key.src_port, session->key.dst_port,
-            session->snd_una, session->rcv_nxt,
-            session->snd_buf.data(), chunk_len,
-            session->recv_window());
+            uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
+            AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
 
-        if (AETHON_LIKELY(sent)) {
+            uint32_t seq = session->snd_una + static_cast<uint32_t>(retrans_offset);
+            bool sent = net::PacketInjector::ipv4_send_tcp_data(
+                sock, tx_buf_addr, pkt,
+                session->client_mac, session->server_mac,
+                session->key.src_ip, session->key.dst_ip,
+                session->key.src_port, session->key.dst_port,
+                seq, session->rcv_nxt,
+                session->snd_buf.data() + retrans_offset, chunk_len,
+                session->recv_window());
+
+            if (AETHON_LIKELY(sent)) {
+                retrans_offset += chunk_len;
+                packets_sent++;
+            } else {
+                tx_pool.push_back(tx_buf_addr);
+                break;
+            }
+        }
+
+        if (packets_sent > 0) {
             session->last_tx_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            // Karn's algorithm: exponential backoff doubling RTO up to 2000 ms
-            session->rto_ms = std::min(session->rto_ms * 2, 2000u);
-            session->retransmit_count++;
+            // Karn's algorithm: Invalidate pending RTT sample upon retransmission
+            session->rtt_time_ns = 0;
+            if (is_rto) {
+                // Issue #8: Exponential backoff doubling RTO up to 60,000 ms (60 seconds, RFC 6298)
+                session->rto_ms = std::min(session->rto_ms * 2, 60000u);
+                session->retransmit_count++;
+            }
             return true;
-        } else {
-            tx_pool.push_back(tx_buf_addr);
-            return false;
         }
+
+        return false;
     }
 
     template <typename Scanner>
@@ -201,20 +239,26 @@ namespace pipeline {
             iph, tcph, payload, payload_len, now_ns);
 
         if (AETHON_UNLIKELY(res.fast_retransmit && res.session)) {
-            retransmit_unacked_data(sock, res.session, tx_pool);
+            // RFC 5681: Fast Retransmit sends single lost segment at snd_una without RTO backoff
+            retransmit_unacked_data(sock, res.session, tx_pool, 1, false);
         }
 
         if(AETHON_UNLIKELY(res.is_syn && res.session)){
             std::memcpy(res.session->client_mac,eth->ether_shost,6);
             std::memcpy(res.session->server_mac, eth->ether_dhost, 6);
 
-            constexpr uint32_t initial_server_isn  = 1000000;
-            res.session->send_nxt = initial_server_isn + 1;
-            res.session->snd_una = initial_server_isn + 1;
-
+            // RFC 6528: Only generate a new randomized ISN if this is a fresh handshake (server_isn == 0).
+            // Retransmitted SYNs in SYN_SENT state reuse the existing server_isn without resetting sequence numbers!
+            if (res.session->server_isn == 0) {
+                res.session->server_isn = generate_random_isn();
+                res.session->send_nxt = res.session->server_isn + 1;
+                res.session->snd_una = res.session->server_isn + 1;
+            }
+            // RFC 6298: Record timestamp of SYN-ACK transmission for initial handshake RTT measurement
+            res.session->synack_tx_time_ns = now_ns;
 
             return net::PacketInjector::ipv4_send_tcp_syn_ack(
-                sock, buf_addr, pkt, eth, iph, tcph, initial_server_isn, ntohl(tcph->seq));
+                sock, buf_addr, pkt, eth, iph, tcph, res.session->server_isn, ntohl(tcph->seq));
         }
         
 
@@ -345,9 +389,11 @@ namespace pipeline {
                 }
 
                 if (res.session->tls_conn.is_established()) {
+                    bool any_decrypted = false;
                     uint8_t plain_buf[16384];
-                    int plain_len = res.session->tls_conn.decrypt(plain_buf, sizeof(plain_buf));
-                    if (plain_len > 0) {
+                    int plain_len;
+                    while ((plain_len = res.session->tls_conn.decrypt(plain_buf, sizeof(plain_buf))) > 0) {
+                        any_decrypted = true;
                         if (AETHON_UNLIKELY(res.session && !res.session->hs_stream)) {
                             res.session->hs_stream = scanner.open_stream();
                         }
@@ -401,11 +447,13 @@ namespace pipeline {
                                         res.session->epollout_armed = true;
                                     }
                                 }
-
-                                return net::PacketInjector::ipv4_send_tcp_ack(
-                                    sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
                             }
                         }
+                    }
+
+                    if (any_decrypted) {
+                        return net::PacketInjector::ipv4_send_tcp_ack(
+                            sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
                     }
                 }
 
@@ -527,7 +575,8 @@ namespace pipeline {
         std::vector<uint64_t> &tx_pool,
         IPv4TcpAssembler::TcpAssemblerEngine &tcp_engine
     ) noexcept {
-        static uint64_t last_rto_sweep_ns = 0;
+        // Issue #10: thread_local prevents cross-thread data race and worker starvation
+        thread_local uint64_t last_rto_sweep_ns = 0;
         uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 
@@ -537,6 +586,7 @@ namespace pipeline {
         }
         last_rto_sweep_ns = now_ns;
 
+        constexpr uint8_t MAX_TCP_RETRIES = 8;
         uint32_t retransmitted = 0;
         tcp_engine.for_each_session([&](IPv4TcpAssembler::TcpStreamSession *session) {
             if (session && session->state == IPv4TcpAssembler::TcpState::ESTABLISHED) {
@@ -544,12 +594,13 @@ namespace pipeline {
                 if (session->snd_una != session->send_nxt && !session->snd_buf.empty()) {
                     uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
                     if (now_ns - session->last_tx_time_ns > rto_ns) {
-                        if (session->retransmit_count >= 5) {
+                        if (session->retransmit_count >= MAX_TCP_RETRIES) {
                             // Max retries exceeded: remote client is dead, close session
                             tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                         } else {
                             session->cc.on_rto_timeout();
-                            if (retransmit_unacked_data(sock, session, tx_pool)) {
+                            // Issue #9: Go-Back-N burst retransmission sending up to 10 packets
+                            if (retransmit_unacked_data(sock, session, tx_pool, 10, true)) {
                                 retransmitted++;
                             }
                         }

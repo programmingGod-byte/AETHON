@@ -203,10 +203,10 @@ namespace aethon {
                         break;
                         
                     case TCPOPT_WINDOW: // kind 3 window scale (length = 3)
-                        if(AETHON_LIKELY(len == TCPOLEN_WINDOW)){
-                            out_params.wscale = *(opt + 2);
-                            if(out_params.wscale > 14) out_params.wscale = 14 ; // max shift 14
-                        }
+                        // RFC 7323 Section 2.2: Window scale is only enabled if negotiated in BOTH
+                        // SYN and SYN-ACK. Since Aethon's SYN-ACK does not include TCPOPT_WINDOW,
+                        // window scaling must remain disabled (wscale = 0).
+                        out_params.wscale = 0;
                         break;
                     
                     case TCPOPT_SACK_PERMITTED:
@@ -256,6 +256,7 @@ namespace aethon {
             uint8_t _pad0{0};
             uint16_t out_of_order_count{0}; // how many out of out packet sitting in the ring buffer
             uint32_t isn{0};
+            uint32_t server_isn{0};         // RFC 6528: Server Initial Sequence Number (randomized)
             uint32_t rcv_nxt{0};
             uint64_t last_seen_ns{0};
             TcpNegotiatedParams params{};
@@ -283,8 +284,36 @@ namespace aethon {
             static constexpr size_t MAX_SND_BUF = 256 * 1024; // 256 KB max in-flight
             std::vector<uint8_t> snd_buf;              // Data in-flight or waiting to be sent
             uint64_t last_tx_time_ns{0};               // Timestamp of last transmission
-            uint32_t rto_ms{200};                       // RTO in milliseconds (starts at 200ms)
+            uint32_t rto_ms{1000};                     // RTO in milliseconds (RFC 6298: 1s initial)
             uint8_t retransmit_count{0};               // Number of retransmissions
+
+            // RFC 6298: Dynamic RTT and RTO estimation (Jacobson's Algorithm)
+            uint32_t srtt_ms{0};                       // Smoothed round-trip time
+            uint32_t rttvar_ms{0};                     // Round-trip time variation
+            uint64_t synack_tx_time_ns{0};             // Timestamp of SYN-ACK transmission for handshake RTT
+            uint32_t rtt_seq{0};                       // TCP seq number tracked for RTT sample
+            uint64_t rtt_time_ns{0};                   // Timestamp when rtt_seq was transmitted
+
+            AETHON_ALWAYS_INLINE void update_rtt(uint32_t sample_ms) noexcept {
+                if (sample_ms == 0) sample_ms = 1;
+                if (AETHON_UNLIKELY(srtt_ms == 0)) {
+                    // RFC 6298 Section 2.2: First RTT measurement
+                    // SRTT <- R, RTTVAR <- R/2
+                    srtt_ms = sample_ms;
+                    rttvar_ms = sample_ms >> 1;
+                } else {
+                    // RFC 6298 Section 2.3: Subsequent RTT measurements
+                    // alpha = 1/8 (0.125), beta = 1/4 (0.25)
+                    // RTTVAR <- (3/4) * RTTVAR + (1/4) * |SRTT - sample|
+                    // SRTT   <- (7/8) * SRTT + (1/8) * sample
+                    int32_t delta = static_cast<int32_t>(srtt_ms) - static_cast<int32_t>(sample_ms);
+                    if (delta < 0) delta = -delta;
+                    rttvar_ms = (3 * rttvar_ms + static_cast<uint32_t>(delta)) >> 2;
+                    srtt_ms = (7 * srtt_ms + sample_ms) >> 3;
+                }
+                // RFC 6298 Section 2.4: RTO = SRTT + 4 * RTTVAR, clamped to [200 ms, 60000 ms]
+                rto_ms = std::min(std::max(srtt_ms + (rttvar_ms << 2), 200u), 60000u);
+            }
 
             uint8_t dup_ack_count{0};                      // Number of duplicate ACKs received
             tcp::TcpRenoCongestionControl cc;              // Congestion Control (cwnd, ssthresh)
@@ -737,10 +766,16 @@ namespace aethon {
                     return result;
                 }
 
-                // SYN Retransmission: Duplicate handshake packer
-
-                if(AETHON_UNLIKELY(flags & TH_SYN)){
-                    result.is_syn = true;
+                // SYN Packet on an existing session lookup
+                if (AETHON_UNLIKELY(flags & TH_SYN)) {
+                    if (session->state == TcpState::SYN_SENT) {
+                        // Legitimate duplicate handshake SYN (client retransmission before connection established)
+                        result.is_syn = true;
+                    } else {
+                        // RFC 5961 Section 4: In-window SYN on ESTABLISHED/CLOSING connection.
+                        // MUST NOT reset sequence numbers or state! Send an RFC 5961 Challenge ACK.
+                        result.need_ack = true;
+                    }
                     return result;
                 }
 
@@ -749,6 +784,12 @@ namespace aethon {
                 if (AETHON_UNLIKELY(session->state == TcpState::SYN_SENT)) {
                     if (AETHON_LIKELY(flags & TH_ACK)) {
                         session->state = TcpState::ESTABLISHED;
+                        // RFC 6298: Handshake RTT measurement from SYN-ACK transmission to client ACK
+                        if (session->synack_tx_time_ns > 0) {
+                            uint32_t sample_ms = static_cast<uint32_t>((now_ns - session->synack_tx_time_ns) / 1000000ULL);
+                            session->update_rtt(sample_ms);
+                            session->synack_tx_time_ns = 0;
+                        }
                     } else {
                         return result;
                     }
@@ -773,10 +814,19 @@ namespace aethon {
                             session->snd_buf.clear();
                         }
 
+                        // RFC 6298 (Karn's Algorithm): Update RTT if this ACK covers the sampled sequence
+                        if (session->rtt_time_ns > 0 && session->retransmit_count == 0 && TcpSeq::gte(ack_seq, session->rtt_seq)) {
+                            uint32_t sample_ms = static_cast<uint32_t>((now_ns - session->rtt_time_ns) / 1000000ULL);
+                            session->update_rtt(sample_ms);
+                            session->rtt_time_ns = 0;
+                        }
+
                         session->snd_una = ack_seq;
                         session->cc.on_ack(bytes_acked);
-                        // Successful ACK: reset RTO timer and retry counter
-                        session->rto_ms = 200;
+                        // Reset RTO timer and retry counter (RFC 6298 dynamic RTO)
+                        session->rto_ms = (session->srtt_ms > 0)
+                            ? std::min(std::max(session->srtt_ms + (session->rttvar_ms << 2), 200u), 60000u)
+                            : 200u;
                         session->retransmit_count = 0;
                         session->dup_ack_count = 0;
                         session->last_tx_time_ns = now_ns;
