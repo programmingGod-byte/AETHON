@@ -2,6 +2,7 @@
 """
 Aethon IPS - JA3 Fingerprint Rate Limiting Test Suite
 Tests rate-limiting of TLS ClientHello connections based on JA3 fingerprint.
+Uses raw TCP injection (same method as test_tls_sni.py, test_dpi_scanner.py).
 """
 
 import sys
@@ -57,12 +58,12 @@ def build_tls_client_hello(domain_str, ciphers=None):
     extensions_data = sni_ext + groups_ext + ec_ext
     extensions = struct.pack('!H', len(extensions_data)) + extensions_data
 
-    client_version = struct.pack('!H', 0x0303) # TLS 1.2
+    client_version = struct.pack('!H', 0x0303)  # TLS 1.2
     random_bytes = os.urandom(32)
     session_id = b'\x00'
 
     if ciphers is None:
-        ciphers = [0x1301, 0x1302, 0x1303]  # Profile 1 (TLS_AES_128_GCM_SHA256, etc.)
+        ciphers = [0x1301, 0x1302, 0x1303]
 
     ciphers_data = b"".join(struct.pack('!H', c) for c in ciphers)
     cipher_suites = struct.pack('!H', len(ciphers_data)) + ciphers_data
@@ -107,7 +108,7 @@ def main():
         print(f"Target       : {target_ip}:443")
         print(f"Source IP    : {src_ip}")
         print(f"Interface    : {iface}")
-        print(f"Allowed SNI  : {domain}")
+        print(f"SNI Domain   : {domain}")
         print(f"Rate Window  : 10 seconds")
         print(f"Rate Limit   : 10 connections / JA3")
         print("==========================================================")
@@ -120,7 +121,7 @@ def main():
         ciphers_profile_2 = [0xC02F, 0xC030]
         ch_payload_2 = build_tls_client_hello(domain, ciphers_profile_2)
 
-        base_port = random.randint(30000, 50000)
+        base_port = 40000
 
         print("\n[PHASE 1] Sending 10 ClientHellos with JA3 Profile 1 (Within Quota)...")
         for i in range(1, 11):

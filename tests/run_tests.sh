@@ -115,7 +115,7 @@ run_choice() {
             ;;
         16)
             echo "🚀 Launching TLS JA3 Fingerprint Rate Limiting Test..."
-            sudo ip netns exec client_ns python3 tests/test_ja3_rate_limit.py 192.168.50.1 192.168.50.2 veth1 mydomain.com
+            sudo ip netns exec client_ns python3 tests/test_ja3_rate_limit.py 192.168.50.1 443 mydomain.com
             ;;
         q|Q)
             exit 0

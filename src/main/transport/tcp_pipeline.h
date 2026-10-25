@@ -39,7 +39,6 @@
 
 namespace aethon {
 namespace pipeline {
-    /* JA3 RATE LIMITING DISABLED: kept for later, see the matching block in handle_tcp_packet().
     static constexpr size_t MAX_JA3_IPS = 65536;
     struct rate_lim_ja3{
         std::atomic<uint16_t> tokens{0};
@@ -85,7 +84,6 @@ namespace pipeline {
     using JA3_map = aethon::SingleThreadHashMap<aethon::tls::JA3, struct ja3_ips>;
     inline JA3_map g_ja3_map{1024};
     inline JA3_map* ja3_map{&g_ja3_map};
-    JA3 RATE LIMITING DISABLED (end) */
     AETHON_ALWAYS_INLINE void print_ip(uint32_t ip) noexcept {
         char buf[INET_ADDRSTRLEN];
         struct in_addr addr;
@@ -512,13 +510,9 @@ namespace pipeline {
                 }
             }
 
-            // Parse complete ClientHello to extract SNI and enforce domain policy
             auto tls_info = tls::parse_client_hello(hello_data, hello_len);
-            // bool exceed = false;   // JA3 rate limiting disabled (see below)
+            bool exceed = false;  
             if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(tls_info.is_client_hello, 1, 0.02)) {
-                /* JA3 RATE LIMITING DISABLED: kept for later. Before re-enabling: the map is shared by all
-                   worker threads without locking, the limit is global per fingerprint (all clients of one TLS
-                   library share a JA3), and each entry holds a 256 KB IP array.
                 if (ja3_map && tls_info.ja3_str.curr_id > 0) {
                     auto *value = ja3_map->find(tls_info.ja3_str);
                     if (AETHON_UNLIKELY(value)) {
@@ -561,7 +555,6 @@ namespace pipeline {
                     // Drop: false recycles the RX frame (true means "frame handed to TX" and would leak it)
                     return false;
                 }
-                JA3 RATE LIMITING DISABLED (end) */
                 if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
                     std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
                     std::cout << "  Attacker : ";
