@@ -216,6 +216,34 @@ namespace pipeline {
         return false;
     }
 
+    AETHON_ALWAYS_INLINE static bool send_server_fin(
+        xdp::aethon_xsk_socket_info * __restrict__ sock,
+        uint64_t tx_buf_addr,
+        uint8_t * __restrict__ pkt,
+        IPv4TcpAssembler::TcpStreamSession *session
+    ) noexcept {
+        if (AETHON_UNLIKELY(!sock || !session)) return false;
+        // Retransmission reuses the sequence number; initial transmission consumes 1 seq
+        uint32_t fin_seq = session->fin_sent ? (session->send_nxt - 1) : session->send_nxt;
+        bool sent = net::PacketInjector::ipv4_send_tcp_fin(
+            sock, tx_buf_addr, pkt,
+            session->client_mac, session->server_mac,
+            session->key.src_ip, session->key.dst_ip,
+            session->key.src_port, session->key.dst_port,
+            fin_seq, session->rcv_nxt,
+            session->recv_window());
+        if (AETHON_LIKELY(sent)) {
+            if (!session->fin_sent) {
+                session->send_nxt++; // FIN consumes 1 sequence number
+                session->fin_sent = true;
+            }
+            session->last_tx_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            return true;
+        }
+        return false;
+    }
+
     template <typename Scanner>
     AETHON_ALWAYS_INLINE bool handle_tcp_packet(
         xdp::aethon_xsk_socket_info * __restrict__ sock,
@@ -280,13 +308,18 @@ namespace pipeline {
         }
         
 
-        if(AETHON_UNLIKELY(res.need_ack && res.session)){
+        if (AETHON_UNLIKELY(res.need_ack && !res.is_ready && res.session)) {
+            // If client sent FIN with no payload (Issue #3: Half-closed request), notify backend of EOF
+            if (res.is_fin && res.session->backend_fd >= 0) {
+                ::shutdown(res.session->backend_fd, SHUT_WR);
+            }
             return net::PacketInjector::ipv4_send_tcp_ack(
                 sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
         }
 
-        // Outbound Pump: If client ACKed data on established session, pump any remaining unsent snd_buf
-        if (res.session && res.session->state == IPv4TcpAssembler::TcpState::ESTABLISHED) {
+        // Outbound Pump: If client ACKed data on established or closing session, pump any remaining unsent snd_buf
+        if (res.session && (res.session->state == IPv4TcpAssembler::TcpState::ESTABLISHED ||
+                            res.session->state == IPv4TcpAssembler::TcpState::CLOSING)) {
             if (!res.session->snd_buf.empty()) {
                 send_tcp_segmented_data(sock, res.session, nullptr, 0, tx_pool);
             }
@@ -301,16 +334,21 @@ namespace pipeline {
                 }
             }
 
-            // If backend closed earlier and client has now acknowledged all data, send FIN and close
-            if (res.session->fin_pending && res.session->snd_buf.empty() && res.session->snd_una == res.session->send_nxt) {
-                bool sent = net::PacketInjector::ipv4_send_tcp_fin(
-                    sock, buf_addr, pkt,
-                    eth->ether_shost, eth->ether_dhost,
-                    iph->saddr, iph->daddr,
-                    tcph->source, tcph->dest,
-                    res.session->send_nxt, res.session->rcv_nxt,
-                    res.session->recv_window());
+            // Issue #2: If our FIN was sent and client has now acknowledged our FIN, close the session cleanly
+            if (res.session->fin_sent && res.session->snd_buf.empty() && res.session->snd_una == res.session->send_nxt) {
+                if (res.session->backend_fd >= 0) {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, res.session->backend_fd, nullptr);
+                    ::close(res.session->backend_fd);
+                    res.session->backend_fd = -1;
+                }
                 tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                return false;
+            }
+
+            // Issue #2: If backend closed earlier and client has now acknowledged all data, send FIN
+            if (res.session->fin_pending && !res.session->fin_sent && res.session->snd_buf.empty() && res.session->snd_una == res.session->send_nxt) {
+                bool sent = send_server_fin(sock, buf_addr, pkt, res.session);
+                // DO NOT close session here! Stay alive waiting for client ACK or FIN retransmission!
                 return sent;
             }
         }
@@ -545,6 +583,11 @@ namespace pipeline {
                             }
                         }
                         
+                        // Issue #3B: If packet also carried a FIN, signal EOF to backend socket
+                        if (res.is_fin && res.session->backend_fd >= 0) {
+                            ::shutdown(res.session->backend_fd, SHUT_WR);
+                        }
+
                         return net::PacketInjector::ipv4_send_tcp_ack(
                             sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
                     } else if (res.session) {
@@ -554,27 +597,16 @@ namespace pipeline {
             }
         }
 
+        // RST handling: immediate connection abort by remote peer
         if (AETHON_UNLIKELY(res.is_closed)) {
-            if (res.session) {
-                if (res.session->backend_fd >= 0) {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, res.session->backend_fd, nullptr);
-                    ::close(res.session->backend_fd);
-                    res.session->backend_fd = -1;
-                }
-
-                bool sent = net::PacketInjector::ipv4_send_tcp_fin(
-                    sock, buf_addr, pkt,
-                    eth->ether_shost, eth->ether_dhost,
-                    iph->saddr, iph->daddr,
-                    tcph->source, tcph->dest,
-                    res.session->send_nxt, res.session->rcv_nxt,
-                    res.session->recv_window());
-
-                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
-                return sent;
+            if (res.session && res.session->backend_fd >= 0) {
+                epoll_ctl(epfd, EPOLL_CTL_DEL, res.session->backend_fd, nullptr);
+                ::close(res.session->backend_fd);
+                res.session->backend_fd = -1;
             }
 
             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+            return false;
         }
 
         return false;
@@ -600,7 +632,9 @@ namespace pipeline {
         constexpr uint8_t MAX_TCP_RETRIES = 8;
         uint32_t retransmitted = 0;
         tcp_engine.for_each_session([&](IPv4TcpAssembler::TcpStreamSession *session) {
-            if (session && session->state == IPv4TcpAssembler::TcpState::ESTABLISHED) {
+            // Issue #3B: Inspect both ESTABLISHED and half-closed CLOSING sessions
+            if (session && (session->state == IPv4TcpAssembler::TcpState::ESTABLISHED ||
+                            session->state == IPv4TcpAssembler::TcpState::CLOSING)) {
                 // Check if session has unacknowledged in-flight data
                 if (session->snd_una != session->send_nxt && !session->snd_buf.empty()) {
                     uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
@@ -616,25 +650,39 @@ namespace pipeline {
                             }
                         }
                     }
-                } else if (session->snd_una == session->send_nxt && !session->snd_buf.empty()) {
+                } 
+                // Issue #2: Check if unacknowledged FIN timed out and retransmit it
+                else if (session->fin_sent && session->snd_una != session->send_nxt) {
+                    uint64_t rto_ns = static_cast<uint64_t>(session->rto_ms) * 1000000ULL;
+                    if (now_ns - session->last_tx_time_ns > rto_ns) {
+                        if (session->retransmit_count >= MAX_TCP_RETRIES) {
+                            // Max retries exceeded: client is dead, close session
+                            tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
+                        } else if (!tx_pool.empty()) {
+                            uint64_t tx_buf_addr = tx_pool.back();
+                            tx_pool.pop_back();
+                            uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
+                            if (send_server_fin(sock, tx_buf_addr, pkt, session)) {
+                                session->rto_ms = std::min(session->rto_ms * 2, 60000u);
+                                session->retransmit_count++;
+                                retransmitted++;
+                            } else {
+                                tx_pool.push_back(tx_buf_addr);
+                            }
+                        }
+                    }
+                }
+                else if (session->snd_una == session->send_nxt && !session->snd_buf.empty()) {
                     send_tcp_segmented_data(sock, session, nullptr, 0, tx_pool);
-                } else if (session->fin_pending && session->snd_buf.empty() && session->snd_una == session->send_nxt && !tx_pool.empty()) {
+                } 
+                // Issue #2: All data acknowledged and backend closed -> send initial FIN
+                else if (session->fin_pending && !session->fin_sent && session->snd_buf.empty() && session->snd_una == session->send_nxt && !tx_pool.empty()) {
                     uint64_t tx_buf_addr = tx_pool.back();
                     tx_pool.pop_back();
                     uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
-                    bool sent = net::PacketInjector::ipv4_send_tcp_fin(
-                        sock, tx_buf_addr, pkt,
-                        session->client_mac, session->server_mac,
-                        session->key.src_ip, session->key.dst_ip,
-                        session->key.src_port, session->key.dst_port,
-                        session->send_nxt, session->rcv_nxt,
-                        session->recv_window());
-                    if (sent) {
-                        session->send_nxt++;
-                    } else {
+                    if (!send_server_fin(sock, tx_buf_addr, pkt, session)) {
                         tx_pool.push_back(tx_buf_addr);
                     }
-                    tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                 }
             }
         });
@@ -771,32 +819,18 @@ namespace pipeline {
 
                 }
 
-                // if send_buf is already comppletely empty fully ACKED send FIN immediately
-
-                if(session->snd_buf.empty() && session->snd_una == session->send_nxt){
-
-                    
+                // Issue #2: If send_buf is already completely empty and fully ACKed, send FIN
+                if (session->snd_buf.empty() && session->snd_una == session->send_nxt && !session->fin_sent) {
                     if (!tx_pool.empty()) {
                         uint64_t tx_buf_addr = tx_pool.back();
                         tx_pool.pop_back();
                         uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
-                        bool sent = net::PacketInjector::ipv4_send_tcp_fin(
-                            sock, tx_buf_addr, pkt,
-                            session->client_mac, session->server_mac,
-                            session->key.src_ip, session->key.dst_ip,
-                            session->key.src_port, session->key.dst_port,
-                            session->send_nxt, session->rcv_nxt,
-                            session->recv_window());
-                            if (sent) {
-                                session->send_nxt++;
-                            } else {
-                                tx_pool.push_back(tx_buf_addr);
-                            }
+                        if (!send_server_fin(sock, tx_buf_addr, pkt, session)) {
+                            tx_pool.push_back(tx_buf_addr);
                         }
-                    tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
-                        
-                }else{
-
+                    }
+                    // Keep session alive waiting for client ACK or FIN retransmission!
+                } else {
                     session->fin_pending = true;
                 }
             }

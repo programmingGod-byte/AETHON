@@ -238,6 +238,7 @@ namespace aethon {
              bool is_ready{false};
             bool is_syn{false};
             bool is_closed{false};
+            bool is_fin{false};
             bool need_ack{false};
             uint16_t src_port{0};
             uint16_t dst_port{0};
@@ -320,7 +321,9 @@ namespace aethon {
             tcp::TcpRenoCongestionControl cc;              // Congestion Control (cwnd, ssthresh)
             // Compute dynamic receive window based on remaining buffer capacity
 
-            bool fin_pending{false}; // backend reached EOF ; defer FIN until send_buf drains
+            bool fin_pending{false};          // backend reached EOF ; defer FIN until send_buf drains
+            bool fin_sent{false};             // our FIN has been sent; waiting for client ACK
+            bool client_fin_received{false};  // client sent FIN (half-closed request)
 
 
             AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
@@ -796,8 +799,8 @@ namespace aethon {
                     }
                 }
 
-                // If connection is not ESTABLISHED, ignore data
-                if (AETHON_UNLIKELY(session->state != TcpState::ESTABLISHED)) {
+                // If connection is not ESTABLISHED or CLOSING, ignore data
+                if (AETHON_UNLIKELY(session->state != TcpState::ESTABLISHED && session->state != TcpState::CLOSING)) {
                     return result;
                 }
 
@@ -941,10 +944,12 @@ namespace aethon {
                 } // end
                 
 
-                if(AETHON_UNLIKELY(flags & TH_FIN)){
+                if (AETHON_UNLIKELY(flags & TH_FIN)) {
                     session->rcv_nxt++;
                     session->state = TcpState::CLOSING;
-                    result.is_closed = true;
+                    session->client_fin_received = true;
+                    result.is_fin = true;
+                    result.need_ack = true;
                 }
 
                 return result;
