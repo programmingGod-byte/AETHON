@@ -2,7 +2,7 @@
 
 **An inline intrusion prevention system and TLS-terminating reverse proxy built on eBPF/XDP and AF_XDP, with its own userspace TCP stack.**
 
-Aethon sits in front of your web services on a single Linux host. XDP steers traffic for the ports you protect into userspace through AF_XDP sockets; everything else (SSH, DNS, IPv6, UDP) goes straight to the kernel untouched. In userspace, Aethon terminates TCP and TLS itself, inspects the plaintext with Hyperscan in streaming mode, enforces SNI and JA3 policy, and proxies clean traffic to your backends on loopback.
+Aethon sits in front of your web services on a single Linux host. XDP steers traffic for the ports you protect into userspace through AF_XDP sockets; everything else (SSH, DNS, IPv6, UDP) goes straight to the kernel untouched. In userspace, Aethon terminates TCP and TLS itself, inspects the plaintext with Hyperscan in streaming mode, enforces SNI policy, and proxies clean traffic to your backends on loopback.
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue) ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey) ![eBPF/XDP](https://img.shields.io/badge/eBPF-XDP%20%2B%20AF__XDP-orange) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
@@ -58,7 +58,7 @@ A classic single-server setup for inspecting web traffic is several separate sys
   │     handshake · reassembly · overlap-evasion check · flow control  │
   │     RFC 6298 RTO · Reno congestion control · fast retransmit       │
   │                         │                                          │
-  │  TLS (tls/): ClientHello parsing → SNI blocklist → JA3 rate limit  │
+  │  TLS (tls/): ClientHello parsing (SNI, JA3) → SNI blocklist        │
   │     → OpenSSL termination with memory BIOs                         │
   │                         │                                          │
   │  DPI (dpi/): Hyperscan streaming scan of plaintext                 │
@@ -94,7 +94,7 @@ Responses from the backend are read through epoll, encrypted if the session is T
 ### TLS
 - ClientHello reassembly across segments (large post-quantum ClientHellos from modern browsers).
 - SNI policy: domains listed in `rules/blocked_domains.txt`, and their subdomains, are reset.
-- JA3 fingerprinting with a per-fingerprint rate limit.
+- JA3 fingerprint extraction from the ClientHello. A per-fingerprint rate limiter exists in `tcp_pipeline.h` but is commented out (see Known limitations).
 - TLS termination through OpenSSL memory BIOs, routed to a backend by SNI or by destination IP:port.
 
 ### Deep packet inspection
@@ -162,7 +162,7 @@ Backends must listen on **127.0.0.1**. If they listen on `0.0.0.0`, clients can 
 | `build/src/test_tcp_fuzz [seeds] [bytes]` | no | Randomized reassembly under loss, reordering, duplicates, stale replays, out-of-window junk and tiny segments; the output stream must match byte for byte |
 | `tests/web_app_test/test.sh` | yes | Real clients through Aethon → nginx → Node.js: pages, APIs, keep-alive, sha256 of 5 MB downloads and 20 MB uploads over HTTP and HTTPS, DPI (plain and inside TLS), SNI blocking, bypass check; `--netem` adds delay and loss, `--load` runs wrk |
 | `tests/web_app_test/torture.sh` | yes | Network chaos in both directions (reorder, duplicates, jitter, burst loss, corruption, bandwidth caps), concurrency, connection churn with a leak check, protocol edge cases, adversarial clients (split-payload evasion, slowloris, aborted transfers, handshake floods, SYN floods) |
-| `tests/run_tests.sh` | yes | Older raw-packet scenarios: floods, fragmentation attacks, RST injection, JA3 rate limiting |
+| `tests/run_tests.sh` | yes | Older raw-packet scenarios: floods, fragmentation attacks, RST injection, JA3 rate limiting (option 16 needs the JA3 limiter re-enabled) |
 
 ```bash
 cmake --build build -j && ./build/src/test_tcp_reassembly && ./build/src/test_tcp_fuzz
@@ -197,7 +197,7 @@ Being explicit about these is part of the project.
 - **Established sessions expire after 30 s idle**, shorter than typical browser and nginx keep-alive timeouts.
 - **No global memory budget.** Per-session buffers are capped, but a slow-read attack across many connections can still exhaust memory.
 - **Flows must stay on one RX queue.** Sessions live in per-worker tables; real NICs guarantee this through RSS, while multi-queue veth setups need `net.core.txrehash=0` on the client.
-- **The JA3 table is shared between worker threads without locking** and rate-limits per fingerprint globally (all clients of one TLS library share a JA3). It is work in progress.
+- **JA3 rate limiting is disabled** (commented out, kept for later). Before re-enabling it: its table is shared between worker threads without locking, the limit is global per fingerprint (all clients of one TLS library share a JA3), and each entry holds a 256 KB array.
 - **The XDP rate limiter and IP blocklist are implemented but disabled** in the BPF program.
 - **TLS handshakes and logging run on the packet threads**, so handshake floods and log floods slow down packet processing.
 - **ICMP is handled in userspace** (echo only); other ICMP types are dropped, which can break path MTU discovery.
