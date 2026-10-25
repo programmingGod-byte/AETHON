@@ -28,6 +28,7 @@
 #include <iostream>
 #include <sys/types.h>
 #include <random>
+#include <cassert>
 #include "tls_engine.h"
 #include "tls_parser.h"
 #include "domain_blocklist.h"
@@ -62,7 +63,23 @@ namespace pipeline {
     inline dns::DomainBlocklist g_domain_blocklist;
     inline service::ServiceRegistry g_service_registry;
 
-    AETHON_ALWAYS_INLINE bool send_tcp_segmented_data(
+    enum class SendResult : uint8_t {
+        Queued,
+        QueueFull
+    };
+
+    AETHON_ALWAYS_INLINE static void update_backend_epoll(int epfd, IPv4TcpAssembler::TcpStreamSession *session) noexcept {
+        if (AETHON_UNLIKELY(epfd < 0 || !session || session->backend_fd < 0)) return;
+        struct epoll_event ev{};
+        uint32_t events = EPOLLRDHUP;
+        if (!session->backend_epollin_disabled) events |= EPOLLIN;
+        if (session->epollout_armed) events |= EPOLLOUT;
+        ev.events = events;
+        ev.data.ptr = session;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, session->backend_fd, &ev);
+    }
+
+    AETHON_ALWAYS_INLINE SendResult send_tcp_segmented_data(
         xdp::aethon_xsk_socket_info * __restrict__ sock,
         IPv4TcpAssembler::TcpStreamSession * __restrict__ session,
         const uint8_t * __restrict__ data,
@@ -70,17 +87,18 @@ namespace pipeline {
         std::vector<uint64_t> &tx_pool
     ) noexcept {
         if (AETHON_UNLIKELY(!sock || !session)) {
-            return false;
+            return SendResult::QueueFull;
         }
 
         // if new data append to the snd_buf
-
-        if(data && len > 0){
-            if(session->snd_buf.size() + len > session->MAX_SND_BUF){
-                return false; // buffer full
+        if (data && len > 0) {
+            assert(session->snd_buf.size() + len <= session->MAX_SND_BUF &&
+                   "send_tcp_segmented_data: buffer overflow - data dropped!");
+            if (AETHON_UNLIKELY(session->snd_buf.size() + len > session->MAX_SND_BUF)) {
+                return SendResult::QueueFull;
             }
 
-            session->snd_buf.insert(session->snd_buf.end(),data,data  + len);
+            session->snd_buf.insert(session->snd_buf.end(), data, data + len);
         }
 
         constexpr size_t AETHON_MSS = 1460;
@@ -132,7 +150,7 @@ namespace pipeline {
         }
 
         
-        return (sent_offset == session->snd_buf.size());
+        return SendResult::Queued;
     }
 
     AETHON_ALWAYS_INLINE bool retransmit_unacked_data(
@@ -271,6 +289,16 @@ namespace pipeline {
         if (res.session && res.session->state == IPv4TcpAssembler::TcpState::ESTABLISHED) {
             if (!res.session->snd_buf.empty()) {
                 send_tcp_segmented_data(sock, res.session, nullptr, 0, tx_pool);
+            }
+
+            // Re-arm backend EPOLLIN if space freed up (e.g. >= 64 KB free)
+            if (res.session->backend_epollin_disabled && res.session->backend_fd >= 0) {
+                size_t free_space = (res.session->snd_buf.size() < res.session->MAX_SND_BUF)
+                                    ? (res.session->MAX_SND_BUF - res.session->snd_buf.size()) : 0;
+                if (free_space >= 65536) {
+                    res.session->backend_epollin_disabled = false;
+                    update_backend_epoll(epfd, res.session);
+                }
             }
 
             // If backend closed earlier and client has now acknowledged all data, send FIN and close
@@ -438,13 +466,11 @@ namespace pipeline {
                                         ev.data.ptr = res.session;
                                         epoll_ctl(epfd, EPOLL_CTL_ADD, res.session->backend_fd, &ev);
                                         res.session->epollout_armed = !res.session->backend_tx_buf.empty();
+                                        res.session->backend_epollin_disabled = false;
                                     } else if (!res.session->backend_tx_buf.empty() && !res.session->epollout_armed) {
                                         // Data is buffered and EPOLLOUT is not active: arm EPOLLOUT!
-                                        struct epoll_event ev{};
-                                        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
-                                        ev.data.ptr = res.session;
-                                        epoll_ctl(epfd, EPOLL_CTL_MOD, res.session->backend_fd, &ev);
                                         res.session->epollout_armed = true;
+                                        update_backend_epoll(epfd, res.session);
                                     }
                                 }
                             }
@@ -454,19 +480,6 @@ namespace pipeline {
                     if (any_decrypted) {
                         return net::PacketInjector::ipv4_send_tcp_ack(
                             sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
-                    }
-                }
-
-                if (AETHON_LIKELY(res.session && res.session->backend_fd >= 0)) {
-                    uint8_t resp_buf[16384];
-                    ssize_t resp_len = res.session->read_from_backend(resp_buf, sizeof(resp_buf));
-                    if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(resp_len > 0, 1, 0.90)) {
-                        res.session->tls_conn.encrypt(resp_buf, static_cast<size_t>(resp_len));
-                        uint8_t enc_tx[20480];
-                        int enc_len;
-                        while ((enc_len = res.session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx))) > 0) {
-                            send_tcp_segmented_data(sock, res.session, enc_tx, static_cast<size_t>(enc_len), tx_pool);
-                        }
                     }
                 }
             } else {
@@ -524,13 +537,11 @@ namespace pipeline {
                                 ev.data.ptr = res.session;
                                 epoll_ctl(epfd, EPOLL_CTL_ADD, res.session->backend_fd, &ev);
                                 res.session->epollout_armed = !res.session->backend_tx_buf.empty();
+                                res.session->backend_epollin_disabled = false;
                             } else if (!res.session->backend_tx_buf.empty() && !res.session->epollout_armed) {
                                 // Data is buffered and EPOLLOUT is not active: arm EPOLLOUT!
-                                struct epoll_event ev{};
-                                ev.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
-                                ev.data.ptr = res.session;
-                                epoll_ctl(epfd, EPOLL_CTL_MOD, res.session->backend_fd, &ev);
                                 res.session->epollout_armed = true;
+                                update_backend_epoll(epfd, res.session);
                             }
                         }
                         
@@ -655,12 +666,9 @@ namespace pipeline {
                 session->flush_backend_tx();
                 uint16_t new_win = session->recv_window();
 
-                if (session->backend_tx_buf.empty()) {
-                    struct epoll_event ev{};
-                    ev.events = EPOLLIN | EPOLLRDHUP;
-                    ev.data.ptr = session;
-                    epoll_ctl(epfd, EPOLL_CTL_MOD, session->backend_fd, &ev);
+                if (session->backend_tx_buf.empty() && session->epollout_armed) {
                     session->epollout_armed = false;
+                    update_backend_epoll(epfd, session);
                 }
 
                 // Window Update: If the client was throttled (window < 16 KB) and the buffer
@@ -688,23 +696,37 @@ namespace pipeline {
             
 
             bool backend_closed = false;
-            if(events[i].events & EPOLLIN){
-                // keep reading until kernel buffer is completely empty or send_buf is full
-                while (session->snd_buf.size() < session->MAX_SND_BUF) {
+            if (events[i].events & EPOLLIN) {
+                static constexpr size_t TLS_SLACK = 1024;
+                // Keep reading until kernel buffer is empty or snd_buf has no space
+                while (true) {
+                    size_t free_space = (session->snd_buf.size() < session->MAX_SND_BUF)
+                                        ? (session->MAX_SND_BUF - session->snd_buf.size()) : 0;
+                    size_t required_slack = session->tls_conn.is_established() ? TLS_SLACK : 0;
+                    if (free_space < required_slack + 1) {
+                        // Buffer is full: mask EPOLLIN to prevent level-triggered busy spinning
+                        if (!session->backend_epollin_disabled && session->backend_fd >= 0) {
+                            session->backend_epollin_disabled = true;
+                            update_backend_epoll(epfd, session);
+                        }
+                        break;
+                    }
+
                     uint8_t resp_buf[16384];
-                    ssize_t n = session->read_from_backend(resp_buf, sizeof(resp_buf));
-                    if(n>0){
-                        if(session->tls_conn.is_established()){
+                    size_t want = std::min(sizeof(resp_buf), free_space - required_slack);
+                    ssize_t n = session->read_from_backend(resp_buf, want);
+                    if (n > 0) {
+                        if (session->tls_conn.is_established()) {
                             session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
                             uint8_t enc_tx[20480];
                             int enc_len;
                             while ((enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx))) > 0) {
-                                if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
+                                if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool) == SendResult::Queued) {
                                     work_done++;
                                 }
                             }
-                        }else{
-                             if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
+                        } else {
+                            if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool) == SendResult::Queued) {
                                 work_done++;
                             }
                         }

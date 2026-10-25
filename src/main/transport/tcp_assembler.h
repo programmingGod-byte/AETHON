@@ -271,6 +271,7 @@ namespace aethon {
             static constexpr size_t MAX_BACKEND_BUF = 256 * 1024;
             std::vector<uint8_t> backend_tx_buf;
             bool epollout_armed{false};
+            bool backend_epollin_disabled{false};
 
             /*
                 send_una                                       send_nxt
