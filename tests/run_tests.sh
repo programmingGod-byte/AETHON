@@ -28,6 +28,7 @@ show_menu() {
     echo "13) Python TLS Encrypted Payload Decryption & DPI Exploit Test"
     echo "14) Full Functional TLS Test: Random Packets, Malicious Exploits & Flask Proxy"
     echo "15) Multi-Port Reverse Proxy Test: Ports 5000, 6000 & 8080 Routing"
+    echo "16) Python TLS JA3 Fingerprint Rate Limiting Test"
     echo "q) Exit"
     echo "=================================================="
 }
@@ -112,6 +113,10 @@ run_choice() {
             kill -9 $MULTI_PID 2>/dev/null || true
             fuser -k 5000/tcp 6000/tcp 8080/tcp 2>/dev/null || true
             ;;
+        16)
+            echo "🚀 Launching TLS JA3 Fingerprint Rate Limiting Test..."
+            sudo ip netns exec client_ns python3 tests/test_ja3_rate_limit.py 192.168.50.1 192.168.50.2 veth1 mydomain.com
+            ;;
         q|Q)
             exit 0
             ;;
@@ -126,7 +131,7 @@ if [ -n "$1" ]; then
     run_choice "$1"
 else
     show_menu
-    read -rp "Select test [1-15, q]: " CHOICE
+    read -rp "Select test [1-16, q]: " CHOICE
     run_choice "$CHOICE"
 fi
 

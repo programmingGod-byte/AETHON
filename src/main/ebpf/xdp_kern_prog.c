@@ -240,12 +240,12 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
             goto out;
         }
 
-        __u16 key_token = 1;
-        __u16 key_window = 2;
-        __u16 key_limit = 3;
-        __u64* tokens_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_token);
-        __u64* limit_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_limit);
-        __u64* window_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_window);
+    __u16 key_token = 1;
+    __u16 key_window = 2;
+    __u16 key_limit = 3;
+    __u64* tokens_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_token);
+    __u64* limit_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_limit);
+    __u64* window_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_window);
 
         __u64 tokens_val = tokens_ptr ? *tokens_ptr : 100000ULL;
         __u64 limit_val = limit_ptr ? *limit_ptr : 50000ULL;
