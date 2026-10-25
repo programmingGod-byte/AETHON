@@ -66,6 +66,7 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 #include <hs/hs.h>
 #include <vector>
 #include "aethon/aethon.h"
+#include "tcp_congestion.h"
 
 #ifndef AETHON_ALWAYS_INLINE
 #if defined(__GNUC__) || defined(__clang__)
@@ -286,7 +287,12 @@ namespace aethon {
             uint8_t retransmit_count{0};               // Number of retransmissions
 
             uint8_t dup_ack_count{0};                      // Number of duplicate ACKs received
+            tcp::TcpRenoCongestionControl cc;              // Congestion Control (cwnd, ssthresh)
             // Compute dynamic receive window based on remaining buffer capacity
+
+            bool fin_pending{false}; // backend reached EOF ; defer FIN until send_buf drains
+
+
             AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
                 size_t used = backend_tx_buf.size();
                 if (used >= MAX_BACKEND_BUF) return 0;
@@ -768,6 +774,7 @@ namespace aethon {
                         }
 
                         session->snd_una = ack_seq;
+                        session->cc.on_ack(bytes_acked);
                         // Successful ACK: reset RTO timer and retry counter
                         session->rto_ms = 200;
                         session->retransmit_count = 0;
@@ -777,6 +784,7 @@ namespace aethon {
                         // RFC 5681: Fast Retransmit on 3 duplicate ACKs
                         session->dup_ack_count++;
                         if (session->dup_ack_count == 3) {
+                            session->cc.on_fast_retransmit();
                             result.fast_retransmit = true;
                         }
                     }

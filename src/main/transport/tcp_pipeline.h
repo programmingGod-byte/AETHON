@@ -78,18 +78,14 @@ namespace pipeline {
                 break;
             }
 
-            // client flow control
+            // Combined Flow Control (snd_wnd) and Congestion Control (cwnd)
             size_t in_flight = session->send_nxt - session->snd_una;
-            if(in_flight >= session->snd_wnd){
+            size_t allowed = session->cc.allowed_to_send(in_flight, session->snd_wnd);
+            if (allowed == 0) {
                 break;
             }
 
-            size_t allowed = session->snd_wnd - in_flight;
-
-
-
-
-            size_t chunk_len = std::min({session->snd_buf.size() - sent_offset, AETHON_MSS,allowed});
+            size_t chunk_len = std::min({session->snd_buf.size() - sent_offset, AETHON_MSS, allowed});
             uint64_t tx_buf_addr = tx_pool.back();
             tx_pool.pop_back();
             uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
@@ -227,6 +223,26 @@ namespace pipeline {
                 sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
         }
 
+        // Outbound Pump: If client ACKed data on established session, pump any remaining unsent snd_buf
+        if (res.session && res.session->state == IPv4TcpAssembler::TcpState::ESTABLISHED) {
+            if (!res.session->snd_buf.empty()) {
+                send_tcp_segmented_data(sock, res.session, nullptr, 0, tx_pool);
+            }
+
+            // If backend closed earlier and client has now acknowledged all data, send FIN and close
+            if (res.session->fin_pending && res.session->snd_buf.empty() && res.session->snd_una == res.session->send_nxt) {
+                bool sent = net::PacketInjector::ipv4_send_tcp_fin(
+                    sock, buf_addr, pkt,
+                    eth->ether_shost, eth->ether_dhost,
+                    iph->saddr, iph->daddr,
+                    tcph->source, tcph->dest,
+                    res.session->send_nxt, res.session->rcv_nxt,
+                    res.session->recv_window());
+                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                return sent;
+            }
+        }
+
 
         if (AETHON_LIKELY(res.is_ready && res.payload_len > 0)) {
             const uint8_t * hello_data = res.payload;
@@ -316,12 +332,14 @@ namespace pipeline {
                 res.session->tls_conn.feed_network_data(hello_data, hello_len);
                 res.session->client_hello_buf.clear();
 
-                                if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
+                if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
                     res.session->tls_conn.step_handshake();
-                    uint8_t tx_buf[16384];
-                    int tx_len = res.session->tls_conn.read_pending_tx(tx_buf, sizeof(tx_buf));
-                    if (tx_len > 0) {
+                    uint8_t tx_buf[20480];
+                    int tx_len;
+                    while ((tx_len = res.session->tls_conn.read_pending_tx(tx_buf, sizeof(tx_buf))) > 0) {
                         send_tcp_segmented_data(sock, res.session, tx_buf, static_cast<size_t>(tx_len), tx_pool);
+                    }
+                    if (res.session->tls_conn.status() == tls::TlsSessionStatus::HANDSHAKE) {
                         return false;
                     }
                 }
@@ -396,9 +414,9 @@ namespace pipeline {
                     ssize_t resp_len = res.session->read_from_backend(resp_buf, sizeof(resp_buf));
                     if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(resp_len > 0, 1, 0.90)) {
                         res.session->tls_conn.encrypt(resp_buf, static_cast<size_t>(resp_len));
-                        uint8_t enc_tx[16384];
-                        int enc_len = res.session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
-                        if (AETHON_LIKELY(enc_len > 0)) {
+                        uint8_t enc_tx[20480];
+                        int enc_len;
+                        while ((enc_len = res.session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx))) > 0) {
                             send_tcp_segmented_data(sock, res.session, enc_tx, static_cast<size_t>(enc_len), tx_pool);
                         }
                     }
@@ -530,11 +548,31 @@ namespace pipeline {
                             // Max retries exceeded: remote client is dead, close session
                             tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                         } else {
+                            session->cc.on_rto_timeout();
                             if (retransmit_unacked_data(sock, session, tx_pool)) {
                                 retransmitted++;
                             }
                         }
                     }
+                } else if (session->snd_una == session->send_nxt && !session->snd_buf.empty()) {
+                    send_tcp_segmented_data(sock, session, nullptr, 0, tx_pool);
+                } else if (session->fin_pending && session->snd_buf.empty() && session->snd_una == session->send_nxt && !tx_pool.empty()) {
+                    uint64_t tx_buf_addr = tx_pool.back();
+                    tx_pool.pop_back();
+                    uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
+                    bool sent = net::PacketInjector::ipv4_send_tcp_fin(
+                        sock, tx_buf_addr, pkt,
+                        session->client_mac, session->server_mac,
+                        session->key.src_ip, session->key.dst_ip,
+                        session->key.src_port, session->key.dst_port,
+                        session->send_nxt, session->rcv_nxt,
+                        session->recv_window());
+                    if (sent) {
+                        session->send_nxt++;
+                    } else {
+                        tx_pool.push_back(tx_buf_addr);
+                    }
+                    tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
                 }
             }
         });
@@ -596,58 +634,98 @@ namespace pipeline {
                 }
             }
 
-            bool backend_closed = (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+            
 
-            if (events[i].events & EPOLLIN) {
-                // End-to-end backpressure: only read from backend if outbound send buffer has space
-                if (session->snd_buf.size() < session->MAX_SND_BUF) {
+            bool backend_closed = false;
+            if(events[i].events & EPOLLIN){
+                // keep reading until kernel buffer is completely empty or send_buf is full
+                while (session->snd_buf.size() < session->MAX_SND_BUF) {
                     uint8_t resp_buf[16384];
                     ssize_t n = session->read_from_backend(resp_buf, sizeof(resp_buf));
-                    if (n > 0) {
-                        if (session->tls_conn.is_established()) {
+                    if(n>0){
+                        if(session->tls_conn.is_established()){
                             session->tls_conn.encrypt(resp_buf, static_cast<size_t>(n));
-                            uint8_t enc_tx[16384];
-                            int enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx));
-                            if (AETHON_LIKELY(enc_len > 0)) {
+                            uint8_t enc_tx[20480];
+                            int enc_len;
+                            while ((enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx))) > 0) {
                                 if (send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool)) {
                                     work_done++;
                                 }
                             }
-                        } else {
-                            if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
+                        }else{
+                             if (send_tcp_segmented_data(sock, session, resp_buf, static_cast<size_t>(n), tx_pool)) {
                                 work_done++;
                             }
                         }
                     } else if (n == 0) {
                         backend_closed = true;
+                        break;
+                    } else {
+                        // n < 0: EAGAIN or EWOULDBLOCK means kernel buffer empty for now
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
+                        }
+                        // Other error (e.g. ECONNRESET)
+                        backend_closed = true;
+                        break;
                     }
                 }
             }
 
-            if (AETHON_UNLIKELY(backend_closed)) {
-                epoll_ctl(epfd, EPOLL_CTL_DEL, session->backend_fd, nullptr);
-                ::close(session->backend_fd);
-                session->backend_fd = -1;
+             // Only mark closed if EPOLLHUP/EPOLLERR fired and no unread data remains
+            if ((events[i].events & (EPOLLHUP | EPOLLERR)) && !backend_closed) {
+                backend_closed = true;
+            }
 
-                if (!tx_pool.empty()) {
-                    uint64_t tx_buf_addr = tx_pool.back();
-                    tx_pool.pop_back();
-                    uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
-                    bool sent = net::PacketInjector::ipv4_send_tcp_fin(
-                        sock, tx_buf_addr, pkt,
-                        session->client_mac, session->server_mac,
-                        session->key.src_ip, session->key.dst_ip,
-                        session->key.src_port, session->key.dst_port,
-                        session->send_nxt, session->rcv_nxt,
-                        session->recv_window());
-                    if (sent) {
-                        session->send_nxt++;
-                    } else {
-                        tx_pool.push_back(tx_buf_addr);
-                    }
+
+
+
+
+
+
+
+
+
+
+
+
+            if (AETHON_UNLIKELY(backend_closed)) {
+
+                if(session->backend_fd >=0){
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, session->backend_fd, nullptr);
+                    ::close(session->backend_fd);
+                    session->backend_fd = -1;
+
                 }
 
-                tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
+                // if send_buf is already comppletely empty fully ACKED send FIN immediately
+
+                if(session->snd_buf.empty() && session->snd_una == session->send_nxt){
+
+                    
+                    if (!tx_pool.empty()) {
+                        uint64_t tx_buf_addr = tx_pool.back();
+                        tx_pool.pop_back();
+                        uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
+                        bool sent = net::PacketInjector::ipv4_send_tcp_fin(
+                            sock, tx_buf_addr, pkt,
+                            session->client_mac, session->server_mac,
+                            session->key.src_ip, session->key.dst_ip,
+                            session->key.src_port, session->key.dst_port,
+                            session->send_nxt, session->rcv_nxt,
+                            session->recv_window());
+                            if (sent) {
+                                session->send_nxt++;
+                            } else {
+                                tx_pool.push_back(tx_buf_addr);
+                            }
+                        }
+                    tcp_engine.close_session(session->key.src_ip, session->key.dst_ip, session->key.src_port, session->key.dst_port);
+                        
+                }else{
+
+                    session->fin_pending = true;
+                }
             }
         }
         
