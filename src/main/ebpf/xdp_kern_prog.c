@@ -322,6 +322,11 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
                 action = XDP_PASS;
                 goto out;
             }
+        } else if (iph->protocol == IPPROTO_ICMP) {
+            // Keep for fast user-space ICMP echo reply
+        } else {
+            action = XDP_PASS;
+            goto out;
         }
 
         __u16 frag_off = bpf_ntohs(iph->frag_off);
