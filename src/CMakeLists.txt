@@ -57,6 +57,22 @@ target_link_libraries(test_tcp_reassembly PRIVATE
 )
 target_compile_options(test_tcp_reassembly PRIVATE -Wall -Wextra -Wno-interference-size)
 
+add_executable(test_tcp_fuzz ../tests/test_tcp_fuzz.cpp)
+target_include_directories(test_tcp_fuzz PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/main
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/transport
+    ${LIBHS_INCLUDE_DIRS}
+)
+target_link_libraries(test_tcp_fuzz PRIVATE
+    aethon::aethon
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ${LIBHS_LIBRARIES}
+)
+target_compile_options(test_tcp_fuzz PRIVATE -Wall -Wextra -Wno-interference-size)
+
 add_executable(afxdp_control main/afxdp_control.cpp)
 add_dependencies(afxdp_control ebpf_prog)
 target_include_directories(afxdp_control PRIVATE 

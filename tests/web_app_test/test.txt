@@ -55,6 +55,36 @@ FILES IN THIS FOLDER
   The run ends with:  Result: N passed, M failed, K skipped
 
 
+4b. TORTURE SUITE  (after test.sh passes; Aethon + start.sh still running)
+--------------------------------------------------------------------------
+  ./torture.sh --quick             all sections, small sizes (~5 min)
+  ./torture.sh                     full run (~15-20 min)
+  ./torture.sh --long              + 200 MB down / 100 MB up + 10 s spoofed SYN flood
+  ./torture.sh --only chaos        one section: chaos | concurrency | churn | edges | attacks
+
+  chaos        netem in BOTH directions (client egress + ifb on client ingress):
+               reorder, duplicate, jitter, burst loss, bandwidth cap, corruption, 10% loss;
+               sha256 of HTTP/HTTPS downloads AND uploads under each
+  concurrency  32 parallel downloads, 16 parallel TLS downloads, 8+8 parallel uploads, plus lossy variants
+  churn        2000 short HTTP + 400 short HTTPS connections, wrk connect/close storm,
+               memory must return to normal after sessions expire
+  edges        half-close, pipelining (HTTP/HTTPS), slow reader with 4 KB rcvbuf (zero windows),
+               keep-alive connection idle for 40 s
+  attacks      '/etc/passwd' split across segments / 1 byte per segment / TLS records,
+               garbage on :80/:443, aborted transfers (RST), slowloris, TLS handshake flood,
+               (--long) spoofed SYN flood while a real client keeps working
+
+  After every section: Aethon must still be running and serving HTTP + HTTPS.
+
+4c. OFFLINE TESTS  (no root needed, run anytime)
+-----------------------------------------------
+  cmake --build build -j
+  ./build/src/test_tcp_reassembly        targeted regression tests (overlap, partial fills, SNI policy)
+  ./build/src/test_tcp_fuzz              randomized reassembly torture: loss, reorder, duplicates,
+                                         stale replays, out-of-window junk, tiny segments
+  ./build/src/test_tcp_fuzz 200 2000000  bigger run: 200 seeds x 2 MB per profile
+
+
 5. STOP
 -------
   ./stop.sh            stop nginx + Node
@@ -154,3 +184,27 @@ TROUBLESHOOTING
                                            sudo ip netns exec client_ns sysctl -w net.core.txrehash=0
                                          (start.sh does this; needed again after veth0.bash recreates client_ns)
                                          check queue spread: ethtool -S veth0 | grep -E 'rx_queue_[0-9]+_packets'
+
+
+cd ~/Desktop/learning/advanceCpp/Aethon/tests/web_app_test
+# (start.sh and Aethon running, as before)
+./torture.sh --quick            # ~5 min, all sections
+./torture.sh                    # full, ~15-20 min
+./torture.sh --long             # + 200 MB / 100 MB transfers + SYN flood
+./torture.sh --only attacks     # one section
+
+
+What I expect to fail, from reading the code
+
+┌────────────────────┬───────────────────────────────────────────────────────────────────────────────────────┐
+│        Test        │                                Why it will likely fail                                │
+├────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤
+│ [corruption]       │ Aethon never verifies TCP checksums, only the IP header checksum. A corrupted segment │
+│ HTTP/HTTPS upload  │  is accepted and sent to the backend, so the upload's sha256 won't match. Linux would │
+│                    │  drop it and ask for a resend. This is a real bug                                     │
+├────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤
+│ keep-alive idle 40 │ Aethon deletes ESTABLISHED sessions after 30 s idle, but browsers and nginx keep idle │
+│  s                 │  connections for 60 s or more, so the next request gets an RST                        │
+├────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤
+│ SYN flood (--long) │ No SYN cookies yet, so the session table fills                                        │
+└────────────────────┴───────────────────────────────────────────────────────────────────────────────────────┘
