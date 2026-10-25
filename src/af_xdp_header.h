@@ -357,11 +357,16 @@ public:
         .tx_size = static_cast<uint32_t>(Config::TX_RING_SIZE),
         .libxdp_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
         .xdp_flags = static_cast<uint32_t>(xdp_running_mode),
-        .bind_flags = XDP_COPY
+        .bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP
       };
 
       err = xsk_socket__create(&sock_info->xsk, ifname, q, umen_info->umen,
                                &sock_info->rx, &sock_info->tx, &xsk_config);
+      if (err) {
+        xsk_config.bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP;
+        err = xsk_socket__create(&sock_info->xsk, ifname, q, umen_info->umen,
+                                 &sock_info->rx, &sock_info->tx, &xsk_config);
+      }
       if (err) {
         std::cerr << "Error: Failed to create xsk_socket on queue " << q << "\n";
         return false;

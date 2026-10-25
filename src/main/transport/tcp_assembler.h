@@ -64,7 +64,9 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 */
 #pragma once
 #include <hs/hs.h>
+#include <vector>
 #include "aethon/aethon.h"
+#include "tcp_congestion.h"
 
 #ifndef AETHON_ALWAYS_INLINE
 #if defined(__GNUC__) || defined(__clang__)
@@ -201,10 +203,10 @@ namespace aethon {
                         break;
                         
                     case TCPOPT_WINDOW: // kind 3 window scale (length = 3)
-                        if(AETHON_LIKELY(len == TCPOLEN_WINDOW)){
-                            out_params.wscale = *(opt + 2);
-                            if(out_params.wscale > 14) out_params.wscale = 14 ; // max shift 14
-                        }
+                        // RFC 7323 Section 2.2: Window scale is only enabled if negotiated in BOTH
+                        // SYN and SYN-ACK. Since Aethon's SYN-ACK does not include TCPOPT_WINDOW,
+                        // window scaling must remain disabled (wscale = 0).
+                        out_params.wscale = 0;
                         break;
                     
                     case TCPOPT_SACK_PERMITTED:
@@ -236,12 +238,14 @@ namespace aethon {
              bool is_ready{false};
             bool is_syn{false};
             bool is_closed{false};
+            bool need_ack{false};
             uint16_t src_port{0};
             uint16_t dst_port{0};
             const uint8_t *payload{nullptr};
             size_t payload_len{0};
             TcpStreamSession *session{nullptr};
             hs_stream_t *hs_stream{nullptr};
+            bool fast_retransmit{false};
         };
 
         
@@ -252,6 +256,7 @@ namespace aethon {
             uint8_t _pad0{0};
             uint16_t out_of_order_count{0}; // how many out of out packet sitting in the ring buffer
             uint32_t isn{0};
+            uint32_t server_isn{0};         // RFC 6528: Server Initial Sequence Number (randomized)
             uint32_t rcv_nxt{0};
             uint64_t last_seen_ns{0};
             TcpNegotiatedParams params{};
@@ -263,11 +268,74 @@ namespace aethon {
 
             int backend_fd {-1};
             uint16_t backend_port {0};
+            static constexpr size_t MAX_BACKEND_BUF = 256 * 1024;
+            std::vector<uint8_t> backend_tx_buf;
+            bool epollout_armed{false};
+
+            /*
+                send_una                                       send_nxt
+            [Already Acked]| In flight in snd_buf(3KB)   |    (Not sent yet)    ]     
+
+            */
+
+            // Outbound TCP Reliability State
+            uint32_t snd_una{0};                       // Oldest unacknowledged sequence number
+            uint32_t snd_wnd{65535};                   // Client's advertised receive window (starts at 64 KB)
+            static constexpr size_t MAX_SND_BUF = 256 * 1024; // 256 KB max in-flight
+            std::vector<uint8_t> snd_buf;              // Data in-flight or waiting to be sent
+            uint64_t last_tx_time_ns{0};               // Timestamp of last transmission
+            uint32_t rto_ms{1000};                     // RTO in milliseconds (RFC 6298: 1s initial)
+            uint8_t retransmit_count{0};               // Number of retransmissions
+
+            // RFC 6298: Dynamic RTT and RTO estimation (Jacobson's Algorithm)
+            uint32_t srtt_ms{0};                       // Smoothed round-trip time
+            uint32_t rttvar_ms{0};                     // Round-trip time variation
+            uint64_t synack_tx_time_ns{0};             // Timestamp of SYN-ACK transmission for handshake RTT
+            uint32_t rtt_seq{0};                       // TCP seq number tracked for RTT sample
+            uint64_t rtt_time_ns{0};                   // Timestamp when rtt_seq was transmitted
+
+            AETHON_ALWAYS_INLINE void update_rtt(uint32_t sample_ms) noexcept {
+                if (sample_ms == 0) sample_ms = 1;
+                if (AETHON_UNLIKELY(srtt_ms == 0)) {
+                    // RFC 6298 Section 2.2: First RTT measurement
+                    // SRTT <- R, RTTVAR <- R/2
+                    srtt_ms = sample_ms;
+                    rttvar_ms = sample_ms >> 1;
+                } else {
+                    // RFC 6298 Section 2.3: Subsequent RTT measurements
+                    // alpha = 1/8 (0.125), beta = 1/4 (0.25)
+                    // RTTVAR <- (3/4) * RTTVAR + (1/4) * |SRTT - sample|
+                    // SRTT   <- (7/8) * SRTT + (1/8) * sample
+                    int32_t delta = static_cast<int32_t>(srtt_ms) - static_cast<int32_t>(sample_ms);
+                    if (delta < 0) delta = -delta;
+                    rttvar_ms = (3 * rttvar_ms + static_cast<uint32_t>(delta)) >> 2;
+                    srtt_ms = (7 * srtt_ms + sample_ms) >> 3;
+                }
+                // RFC 6298 Section 2.4: RTO = SRTT + 4 * RTTVAR, clamped to [200 ms, 60000 ms]
+                rto_ms = std::min(std::max(srtt_ms + (rttvar_ms << 2), 200u), 60000u);
+            }
+
+            uint8_t dup_ack_count{0};                      // Number of duplicate ACKs received
+            tcp::TcpRenoCongestionControl cc;              // Congestion Control (cwnd, ssthresh)
+            // Compute dynamic receive window based on remaining buffer capacity
+
+            bool fin_pending{false}; // backend reached EOF ; defer FIN until send_buf drains
+
+
+            AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
+                size_t used = backend_tx_buf.size();
+                if (used >= MAX_BACKEND_BUF) return 0;
+                size_t remaining = MAX_BACKEND_BUF - used;
+                return static_cast<uint16_t>(std::min<size_t>(65535, remaining));
+            }
+
             hs_stream_t *hs_stream{nullptr};
 
             uint8_t client_mac[6]{0};
             uint8_t server_mac[6]{0};
             uint32_t send_nxt{0};
+
+            std::vector<uint8_t> client_hello_buf;
 
             TcpStreamSession() = default;
 
@@ -294,6 +362,19 @@ namespace aethon {
             }
             TcpStreamSession(const TcpStreamSession &) = delete;
             TcpStreamSession &operator=(const TcpStreamSession &) = delete;
+
+
+            AETHON_ALWAYS_INLINE bool flush_backend_tx() noexcept {
+                if(backend_fd < 0 || backend_tx_buf.empty()) return true;
+                ssize_t sent = ::send(backend_fd, backend_tx_buf.data(), backend_tx_buf.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (sent > 0) {
+                    backend_tx_buf.erase(backend_tx_buf.begin(), backend_tx_buf.begin() + sent);
+                }
+                return backend_tx_buf.empty();
+            }
+
+
+
 
             AETHON_ALWAYS_INLINE bool init_bufferes() noexcept {
                 if(AETHON_LIKELY(ring_buf != nullptr)){
@@ -327,37 +408,69 @@ namespace aethon {
                         backend_fd = -1;
                     }
 
+                    backend_tx_buf.clear();
+
                     backend_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
                     if(backend_fd < 0){
                         return false;
                     }
 
-                    int one  =1;
-
+                    int one = 1;
                     setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-                    struct sockaddr_in sin{};
-                    sin.sin_family = AF_INET;
+                    struct sockaddr_in sin {};
+                    sin.sin_family  = AF_INET;
                     sin.sin_port = htons(target_port);
                     sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
                     connect(backend_fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin));
-
                     backend_port = target_port;
-
+                    // Bound the pending write buffer to protect against OOM
+                    if (backend_tx_buf.size() + len > MAX_BACKEND_BUF) {
+                        return false;
+                    }
+                    backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
+                    return true;
                 }
 
-                ssize_t sent = send(backend_fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
-                return sent > 0;
+                if(!backend_tx_buf.empty()){
+                    // Check capacity before buffering in case backend is slow
+                    if (backend_tx_buf.size() + len > MAX_BACKEND_BUF) {
+                        return false;
+                    }
+                    backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
+                    flush_backend_tx();
+                    return true;
+                }
 
+                ssize_t sent = ::send(backend_fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if(sent < 0){
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
+                        if (backend_tx_buf.size() + len > MAX_BACKEND_BUF) {
+                            return false;
+                        }
+                        backend_tx_buf.insert(backend_tx_buf.end(), data, data + len);
+                        return true;
+                    }
+                    return false;
+                }
+
+                if(static_cast<size_t>(sent) < len){
+                    size_t unsent = len - sent;
+                    if (backend_tx_buf.size() + unsent > MAX_BACKEND_BUF) {
+                        return false;
+                    }
+                    backend_tx_buf.insert(backend_tx_buf.end(), data + sent, data + len);
+                }
+                return true;
             }
 
 
             AETHON_ALWAYS_INLINE ssize_t read_from_backend(uint8_t * buf, size_t max_len, int timeout_ms = 50) noexcept {
                  if(AETHON_UNLIKELY(backend_fd < 0 || !buf || max_len == 0)){
-                    return 0;
+                    return -1;
                 }
-                ssize_t n = ::recv(backend_fd, buf, max_len, MSG_DONTWAIT);
-                return (n > 0) ? n : 0;
+                return  ::recv(backend_fd, buf, max_len, MSG_DONTWAIT);
+                
             }
 
             
@@ -501,6 +614,16 @@ namespace aethon {
                 TcpAssemblerEngine (const TcpAssemblerEngine&) = delete;
                 TcpAssemblerEngine &operator=(const TcpAssemblerEngine &) = delete;
 
+                template <typename Fn>
+                void for_each_session(Fn &&fn) noexcept {
+                    for (size_t i = 0; i < sessions_.capacity(); ++i) {
+                        auto *cell = &sessions_.cells()[i];
+                        if (cell->key != KemptyTcpKey && cell->val) {
+                            fn(cell->val);
+                        }
+                    }
+                }
+
                 void clear() noexcept{
                     for(size_t i = 0; i< sessions_.capacity(); i++){
                         auto *cell = &sessions_.cells()[i];
@@ -643,29 +766,78 @@ namespace aethon {
                     return result;
                 }
 
-                // SYN Retransmission: Duplicate handshake packer
-
-                if(AETHON_UNLIKELY(flags & TH_SYN)){
-                    result.is_syn = true;
+                // SYN Packet on an existing session lookup
+                if (AETHON_UNLIKELY(flags & TH_SYN)) {
+                    if (session->state == TcpState::SYN_SENT) {
+                        // Legitimate duplicate handshake SYN (client retransmission before connection established)
+                        result.is_syn = true;
+                    } else {
+                        // RFC 5961 Section 4: In-window SYN on ESTABLISHED/CLOSING connection.
+                        // MUST NOT reset sequence numbers or state! Send an RFC 5961 Challenge ACK.
+                        result.need_ack = true;
+                    }
                     return result;
                 }
 
 
-                // . Transition: First packet after SYN moves session to ESTABLISHED
-                // previous 
-                       
+                // Transition: First packet after SYN moves session to ESTABLISHED
                 if (AETHON_UNLIKELY(session->state == TcpState::SYN_SENT)) {
                     if (AETHON_LIKELY(flags & TH_ACK)) {
                         session->state = TcpState::ESTABLISHED;
+                        // RFC 6298: Handshake RTT measurement from SYN-ACK transmission to client ACK
+                        if (session->synack_tx_time_ns > 0) {
+                            uint32_t sample_ms = static_cast<uint32_t>((now_ns - session->synack_tx_time_ns) / 1000000ULL);
+                            session->update_rtt(sample_ms);
+                            session->synack_tx_time_ns = 0;
+                        }
                     } else {
-                       
                         return result;
                     }
                 }
 
-                 // If connection is not ESTABLISHED, ignore data
+                // If connection is not ESTABLISHED, ignore data
                 if (AETHON_UNLIKELY(session->state != TcpState::ESTABLISHED)) {
                     return result;
+                }
+
+                // Process client ACKs on established connections to slide outbound send window
+                if (AETHON_LIKELY(flags & TH_ACK)) {
+
+                    session->snd_wnd = static_cast<uint32_t>(ntohs(tcph->window)) << session->params.wscale;
+
+                    uint32_t ack_seq = ntohl(tcph->ack_seq);
+                    if (TcpSeq::gt(ack_seq, session->snd_una) && TcpSeq::lte(ack_seq, session->send_nxt)) {
+                        size_t bytes_acked = ack_seq - session->snd_una;
+                        if (bytes_acked <= session->snd_buf.size()) {
+                            session->snd_buf.erase(session->snd_buf.begin(), session->snd_buf.begin() + bytes_acked);
+                        } else {
+                            session->snd_buf.clear();
+                        }
+
+                        // RFC 6298 (Karn's Algorithm): Update RTT if this ACK covers the sampled sequence
+                        if (session->rtt_time_ns > 0 && session->retransmit_count == 0 && TcpSeq::gte(ack_seq, session->rtt_seq)) {
+                            uint32_t sample_ms = static_cast<uint32_t>((now_ns - session->rtt_time_ns) / 1000000ULL);
+                            session->update_rtt(sample_ms);
+                            session->rtt_time_ns = 0;
+                        }
+
+                        session->snd_una = ack_seq;
+                        session->cc.on_ack(bytes_acked);
+                        // Reset RTO timer and retry counter (RFC 6298 dynamic RTO)
+                        session->rto_ms = (session->srtt_ms > 0)
+                            ? std::min(std::max(session->srtt_ms + (session->rttvar_ms << 2), 200u), 60000u)
+                            : 200u;
+                        session->retransmit_count = 0;
+                        session->dup_ack_count = 0;
+                        session->last_tx_time_ns = now_ns;
+                    } else if (ack_seq == session->snd_una && session->snd_una != session->send_nxt && payload_len == 0) {
+                        // RFC 5681: Fast Retransmit on 3 duplicate ACKs
+                        session->dup_ack_count++;
+                        if (session->dup_ack_count == 3) {
+                            session->cc.on_fast_retransmit();
+                            result.fast_retransmit = true;
+                        }
+                    }
                 }
 
                 // process data payload
@@ -684,7 +856,8 @@ namespace aethon {
                     // packet completelybehinf rcv_nxt
 
                     if(AETHON_UNLIKELY(TcpSeq::lte(cur_seq+cur_len,session->rcv_nxt))){
-                        return result; // drop 
+                        result.need_ack = true;
+                        return result; 
                     }
 
                     // partial overlap Packet starts before rcv_nxt , but end after rcv_nxt
@@ -771,11 +944,6 @@ namespace aethon {
                     session->rcv_nxt++;
                     session->state = TcpState::CLOSING;
                     result.is_closed = true;
-                    if(result.payload_len == 0){
-                        delete session;
-                        sessions_.erase(key);
-                        result.session = nullptr;
-                    }
                 }
 
                 return result;

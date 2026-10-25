@@ -121,14 +121,16 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
     public:
         ServiceRegistry () = default;
 
-        bool register_domain(std::string_view domain, const std::string &cert, const std::string &key,uint16_t backend_port){
+        bool register_domain(std::string_view domain, const std::string &cert, const std::string &key, uint16_t backend_port){
             if(service_count_ >= MAX_SERVICES){
                 return false;
             }
 
-
-            SSL_CTX * ctx = create_ssl_context(cert,key);
-            if(!ctx) return false;
+            SSL_CTX *ctx = nullptr;
+            if (cert != "none" && cert != "-" && key != "none" && key != "-") {
+                ctx = create_ssl_context(cert, key);
+                if (!ctx) return false;
+            }
 
             size_t idx = service_count_++;
             services_[idx].identifier = std::string(domain);
@@ -140,23 +142,25 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
             const ServiceConfig *ptr = &services_[idx];
 
             uint64_t d_hash = hash_domain(domain);
-            domain_map_.insert(d_hash,ptr);
+            domain_map_.insert(d_hash, ptr);
 
             return true;
-
         }
 
         bool register_ip_port(const std::string &ip_str, uint16_t port, const std::string &cert, const std::string &key, uint16_t backend_port){
             if (service_count_ >= MAX_SERVICES) {
-            return false;
+                return false;
             }
             struct in_addr addr;
             if (inet_pton(AF_INET, ip_str.c_str(), &addr) <= 0) {
                 return false;
             }
-            SSL_CTX *ctx = create_ssl_context(cert, key);
-            if (!ctx) {
-                return false;
+            SSL_CTX *ctx = nullptr;
+            if (cert != "none" && cert != "-" && key != "none" && key != "-") {
+                ctx = create_ssl_context(cert, key);
+                if (!ctx) {
+                    return false;
+                }
             }
             size_t idx = service_count_++;
             services_[idx].identifier = ip_str + ":" + std::to_string(port);

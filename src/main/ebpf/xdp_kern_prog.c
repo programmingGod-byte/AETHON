@@ -213,11 +213,9 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         src_ip.addr.v4 = iph->saddr;
         src_ip.is_ipv6 = 0;
     } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
-        struct ipv6hdr *ip6h = (struct ipv6hdr *)(eth + 1);
-        if ((void *)(ip6h + 1) > data_end) 
-            return XDP_DROP;
-        __builtin_memcpy(src_ip.addr.v6, ip6h->saddr.in6_u.u6_addr32, 16);
-        src_ip.is_ipv6 = 1;
+        // IPv6 is not proxied in user space; pass directly to Linux kernel network stack
+        action = XDP_PASS;
+        goto out;
     } else {
         // Non-IP traffic (ARP, etc.) -> Pass
         action = XDP_PASS;
