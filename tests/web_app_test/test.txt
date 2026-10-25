@@ -1,0 +1,152 @@
+AETHON WEB APP END-TO-END TEST (veth0 + nginx + Node.js)
+=========================================================
+
+Setup being tested:
+
+  client_ns 192.168.50.2 --veth1==veth0-- 192.168.50.1
+                                            | XDP: managed TCP ports -> AF_XDP
+                                            v
+                                         Aethon --> nginx 127.0.0.1:8080 --> static web app + /files/*.bin
+                                                                       \--> /api/* -> Node.js 127.0.0.1:3000
+
+nginx and Node listen on 127.0.0.1 only, so from client_ns the ONLY way in is through Aethon.
+
+
+FILES IN THIS FOLDER
+--------------------
+  backend/server.js            Node.js app (no npm deps): notes API, upload (returns sha256), file streaming, slow endpoint
+  public/                      "Aethon Notes" web app (HTML/CSS/JS), served by nginx
+  nginx/nginx.conf.template    nginx config (rendered by start.sh into /tmp/aethon_web_app_test/nginx.conf)
+  start.sh                     sets up veth0 + client_ns, disables offloads, generates 1/5/50 MB files, starts Node + nginx
+  test.sh                      real-client tests from client_ns, prints PASS/FAIL summary
+  stop.sh                      stops nginx + Node (--net also removes veth0/client_ns and detaches XDP)
+
+
+1. ONE-TIME SETUP
+-----------------
+  sudo apt install -y nginx wrk ethtool
+  cd ~/Desktop/learning/advanceCpp/Aethon
+  cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+
+  rules/services.conf must contain (default config already does):
+    192.168.50.1:443 certs/server.crt certs/server.key 8080
+    192.168.50.1:80 none none 8080
+
+
+2. START THE WEB STACK  (terminal 1, as your normal user, NOT sudo)
+-------------------------------------------------------------------
+  cd ~/Desktop/learning/advanceCpp/Aethon/tests/web_app_test
+  ./start.sh
+
+
+3. START AETHON  (terminal 2)
+-----------------------------
+  cd ~/Desktop/learning/advanceCpp/Aethon
+  sudo ./build/src/afxdp_control veth0
+
+
+4. RUN THE TESTS  (terminal 1)
+------------------------------
+  ./test.sh                                         functional + integrity + security, HTTP and HTTPS
+  ./test.sh --netem                                 same, with 50 ms delay + 2% packet loss
+  ./test.sh --netem "delay 150ms loss 1%" --full    long RTT, includes the 50 MB file
+  ./test.sh --load                                  wrk load: through Aethon vs. nginx directly
+
+  The run ends with:  Result: N passed, M failed, K skipped
+
+
+5. STOP
+-------
+  ./stop.sh            stop nginx + Node
+  ./stop.sh --net      also remove veth0, client_ns and XDP
+
+
+WHAT test.sh CHECKS
+-------------------
+  HTTP (port 80)
+    - static index page
+    - API health through the nginx proxy
+    - notes create + list (POST/GET JSON)
+    - 5 requests on one keep-alive connection
+    - sha256 of 1 MB / 5 MB downloads (50 MB with --full)   -> large responses arrive byte-exact
+    - 5 MB response streamed by Node through nginx
+    - 20 MB upload, backend's sha256 must match             -> client->backend flow control
+    - slow backend (1.5 s)
+
+  SECURITY
+    - "/etc/passwd" in the URL is blocked by Hyperscan DPI
+    - nginx is NOT reachable directly on :8080 (no bypass around Aethon)
+
+  HTTPS (port 443, TLS terminated by Aethon)
+    - health, sha256 of downloads, 20 MB upload
+    - DPI blocks "/etc/passwd" inside TLS
+    - SNI block for the first domain in rules/blocked_domains.txt (mydomain.com by default)
+
+  --load
+    - wrk requests/s and latency through Aethon vs. nginx directly
+    - Aethon RSS after the load
+
+
+WHAT TO LOOK FOR
+----------------
+  * Run ./test.sh and ./test.sh --netem first. The sha256 checks under loss are the real
+    test of the TCP stack. A mismatch or timeout there = a real bug.
+    Note which test failed + the last lines of Aethon's output.
+
+  * --load: the gap between "through Aethon" and "nginx directly" is Aethon's overhead.
+    Write this number down for the benchmarks page. Also note the RSS after load
+    (it stays high for now: there is no global memory budget yet).
+
+  * Use test.local for TLS tests, NOT mydomain.com: rules/blocked_domains.txt blocks
+    mydomain.com (and its subdomains).
+
+
+MANUAL CHECKS (optional)
+------------------------
+  C="sudo ip netns exec client_ns"
+  T="--resolve test.local:443:192.168.50.1 -k"
+
+  $C curl -s http://192.168.50.1/
+  $C curl -s http://192.168.50.1/api/health
+  $C curl -s $T https://test.local/api/health
+  $C curl -s http://192.168.50.1/files/5mb.bin | sha256sum
+  cat /tmp/aethon_web_app_test/files/SHA256SUMS                  expected hashes
+  $C curl -sv "http://192.168.50.1/api/health?f=/etc/passwd"      expect: connection reset
+  $C curl -sv http://192.168.50.1:8080/ --max-time 3              expect: connection refused
+
+  Packet loss by hand:
+  $C tc qdisc add dev veth1 root netem delay 50ms loss 2%
+  ...run downloads...
+  $C tc qdisc del dev veth1 root
+
+  Watch Aethon memory:
+  watch -n1 'ps -o rss= -C afxdp_control'
+
+  See packets:
+  $C tcpdump -ni veth1 -c 50 tcp
+
+  Browser (from inside client_ns):
+  sudo ip netns exec client_ns sudo -u "$USER" firefox http://192.168.50.1/
+  Or test the app without Aethon at http://127.0.0.1:8080
+
+
+LOGS
+----
+  /tmp/aethon_web_app_test/logs/access.log    nginx access log (all clients show as 127.0.0.1: Aethon proxies over loopback)
+  /tmp/aethon_web_app_test/logs/error.log     nginx errors
+  /tmp/aethon_web_app_test/logs/node.log      Node backend output
+  /tmp/aethon_web_app_test/files/SHA256SUMS   expected hashes of the test files
+
+
+TROUBLESHOOTING
+---------------
+  "port 3000/8080 already in use"     -> ./stop.sh, or stop the other service using that port
+  "nginx not found"                   -> sudo apt install -y nginx
+  "node not found" under sudo         -> run start.sh as your normal user (nvm's node isn't on root's PATH)
+  big downloads stall / hash mismatch -> check offloads are off:
+                                           ethtool -k veth0 | grep -E 'tcp-segmentation|generic-(segmentation|receive)'
+                                         then check Aethon output for errors
+  everything times out                -> is Aethon running? (pgrep -f afxdp_control)
+                                         is XDP attached? (ip link show veth0 | grep xdp)
+  TLS tests skipped                   -> 192.168.50.1:443 line missing in rules/services.conf
+  stuck XDP after a crash             -> sudo ip link set dev veth0 xdp off

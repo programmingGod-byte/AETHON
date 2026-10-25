@@ -1,0 +1,13 @@
+{
+  "name": "aethon-web-app-test-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dependency-free Node.js backend used to test Aethon end to end behind nginx",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

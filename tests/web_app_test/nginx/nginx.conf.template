@@ -1,0 +1,61 @@
+# Rendered by start.sh: __RUN_DIR__ and __PUBLIC_DIR__ are replaced with absolute paths.
+# nginx listens on loopback only, so the only way in from veth0 is through Aethon.
+
+worker_processes 1;
+pid __RUN_DIR__/nginx.pid;
+error_log __RUN_DIR__/logs/error.log warn;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    types {
+        text/html                html;
+        text/css                 css;
+        application/javascript   js;
+        application/json         json;
+        application/octet-stream bin;
+    }
+    default_type application/octet-stream;
+
+    access_log __RUN_DIR__/logs/access.log;
+
+    client_body_temp_path __RUN_DIR__/tmp/body;
+    proxy_temp_path       __RUN_DIR__/tmp/proxy;
+    fastcgi_temp_path     __RUN_DIR__/tmp/fastcgi;
+    uwsgi_temp_path       __RUN_DIR__/tmp/uwsgi;
+    scgi_temp_path        __RUN_DIR__/tmp/scgi;
+
+    sendfile on;
+    keepalive_timeout 65;
+    client_max_body_size 200m;
+
+    upstream node_backend {
+        server 127.0.0.1:3000;
+        keepalive 32;
+    }
+
+    server {
+        listen 127.0.0.1:8080;
+        server_name _;
+
+        # Web app (static)
+        root __PUBLIC_DIR__;
+        index index.html;
+
+        # Large generated test files (static, via sendfile)
+        location /files/ {
+            alias __RUN_DIR__/files/;
+        }
+
+        # API -> Node.js
+        location /api/ {
+            proxy_pass http://node_backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_read_timeout 60s;
+        }
+    }
+}

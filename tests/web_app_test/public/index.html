@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aethon Notes</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Aethon Notes</h1>
+      <p class="sub">Served by nginx, API by Node.js, traffic inspected by Aethon.</p>
+      <p id="status" class="status">Checking backend…</p>
+    </header>
+
+    <form id="note-form">
+      <input id="note-text" maxlength="500" placeholder="Write a note…" autocomplete="off" required>
+      <button type="submit">Add</button>
+    </form>
+
+    <ul id="notes"></ul>
+
+    <section class="files">
+      <h2>Test downloads</h2>
+      <p>Static (nginx): <a href="/files/1mb.bin">1 MB</a> · <a href="/files/5mb.bin">5 MB</a> · <a href="/files/50mb.bin">50 MB</a></p>
+      <p>Streamed (Node): <a href="/api/file/1mb.bin">1 MB</a> · <a href="/api/file/5mb.bin">5 MB</a></p>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
