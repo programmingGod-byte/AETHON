@@ -553,7 +553,8 @@ namespace pipeline {
                     print_ip(iph->saddr);
                     std::cout << ":" << ntohs(tcph->source) << std::endl;
                     std::cout << "  JA3      : " << tls_info.ja3() << std::endl;
-                    return true;
+                    // Drop: false recycles the RX frame (true means "frame handed to TX" and would leak it)
+                    return false;
                 }
                 if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
                     std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
