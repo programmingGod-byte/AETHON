@@ -104,6 +104,8 @@ public:
             return false;
         }
 
+        // Subdomains of a blocked domain are blocked too (api.mydomain.com when mydomain.com is listed).
+        // Bare TLDs ("com", "local") are never matched.
         size_t dot_pos = lower_domain.find('.');
         while (dot_pos != std::string_view::npos) {
             std::string_view parent_domain = lower_domain.substr(dot_pos + 1);
@@ -111,12 +113,12 @@ public:
                 break;
             }
             if (blocked_domains_.find(parent_domain) != blocked_domains_.end()) {
-                return true;
+                return false;
             }
             dot_pos = lower_domain.find('.', dot_pos + 1);
         }
 
-        return false;
+        return true;
     }
 
 

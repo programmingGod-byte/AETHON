@@ -537,6 +537,20 @@ namespace aethon {
                 }
             }
 
+            // Overlap evasion check: true if any byte that is ALREADY buffered (bitmap bit set)
+            // differs from the new data. Unbuffered positions hold stale ring data and are skipped,
+            // so a retransmission with different segment boundaries is not mistaken for an attack.
+            AETHON_ALWAYS_INLINE bool conflicts_with_buffered(uint32_t seq, const uint8_t *data, size_t len) const noexcept {
+                if (!bitmap || !ring_buf) return false;
+                for (size_t i = 0; i < len; ++i) {
+                    size_t pos = (seq + i) & 0xFFFF;
+                    if (((bitmap[pos >> 6] >> (pos & 63)) & 1ULL) && ring_buf[pos] != data[i]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
             AETHON_ALWAYS_INLINE bool is_range_set(size_t start, size_t count) const noexcept {
                 if (!bitmap || count == 0) return false;
                 start &= 0xFFFF;
@@ -884,38 +898,30 @@ namespace aethon {
                     }else if(TcpSeq::gt(cur_seq, session->rcv_nxt)){
 
                         if(AETHON_LIKELY(session->init_bufferes())){
-                            if (session->is_range_set(cur_seq, cur_len)) {
-                                uint8_t existing[1500];
-                                size_t check_len = (cur_len < sizeof(existing)) ? cur_len : sizeof(existing);
-                                session->read_ring_buffer(cur_seq, existing, check_len);
-                                if (std::memcmp(existing, cur_payload, check_len) != 0) {
-                                    result.is_closed = true;
-                                    delete session;
-                                    sessions_.erase(key);
-                                    result.session = nullptr;
-                                    return result;
-                                }
+                            if (session->conflicts_with_buffered(cur_seq, cur_payload, cur_len)) {
+                                result.is_closed = true;
+                                delete session;
+                                sessions_.erase(key);
+                                result.session = nullptr;
+                                return result;
                             }
                             session->write_ring_buffer(cur_seq, cur_payload, cur_len);
                             session->set_bitmap_range(cur_seq, cur_len);
                             session->out_of_order_count++;
+                            // Duplicate ACK for rcv_nxt: lets the client fast-retransmit the missing segment
+                            result.need_ack = true;
                         }
                     }
 
                     // gap - filler packet (fills the missing hole at rcv_nxt)
                     else{
                         if(AETHON_LIKELY(session->init_bufferes())){
-                            if (session->is_range_set(cur_seq, cur_len)) {
-                                uint8_t existing[1500];
-                                size_t check_len = (cur_len < sizeof(existing)) ? cur_len : sizeof(existing);
-                                session->read_ring_buffer(cur_seq, existing, check_len);
-                                if (std::memcmp(existing, cur_payload, check_len) != 0) {
-                                    result.is_closed = true;
-                                    delete session;
-                                    sessions_.erase(key);
-                                    result.session = nullptr;
-                                    return result;
-                                }
+                            if (session->conflicts_with_buffered(cur_seq, cur_payload, cur_len)) {
+                                result.is_closed = true;
+                                delete session;
+                                sessions_.erase(key);
+                                result.session = nullptr;
+                                return result;
                             }
                             session->write_ring_buffer(cur_seq, cur_payload, cur_len);
                             session->set_bitmap_range(cur_seq, cur_len);
