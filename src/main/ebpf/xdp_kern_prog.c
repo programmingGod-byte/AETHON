@@ -310,23 +310,18 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         struct iphdr *iph = (struct iphdr *)(eth + 1);
         if ((void *)(iph + 1) > data_end) return XDP_DROP;
 
-        // Non-TCP traffic (ICMP ping, UDP DNS, etc.): PASS to Linux host OS
-        if (iph->protocol != IPPROTO_TCP) {
-            action = XDP_PASS;
-            goto out;
-        }
+        if (iph->protocol == IPPROTO_TCP) {
+            if (iph->ihl < 5) return XDP_DROP;
+            void *tcp_start = (void *)iph + (iph->ihl * 4);
+            struct tcphdr *tcph = (struct tcphdr *)tcp_start;
+            if ((void *)(tcph + 1) > data_end) return XDP_DROP;
 
-        if (iph->ihl < 5) return XDP_DROP;
-        void *tcp_start = (void *)iph + (iph->ihl * 4);
-        struct tcphdr *tcph = (struct tcphdr *)tcp_start;
-        if ((void *)(tcph + 1) > data_end) return XDP_DROP;
-
-        __u16 dport = bpf_ntohs(tcph->dest);
-        __u8 *service_active = bpf_map_lookup_elem(&aethon_services_map, &dport);
-        if (!service_active) {
-            // Port is not an Aethon service (e.g. port 22 SSH): PASS directly to host OS!
-            action = XDP_PASS;
-            goto out;
+            __u16 dport = bpf_ntohs(tcph->dest);
+            __u8 *service_active = bpf_map_lookup_elem(&aethon_services_map, &dport);
+            if (!service_active) {
+                action = XDP_PASS;
+                goto out;
+            }
         }
 
         __u16 frag_off = bpf_ntohs(iph->frag_off);

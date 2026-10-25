@@ -48,16 +48,56 @@ namespace pipeline {
         }
     }
 
-    AETHON_ALWAYS_INLINE static uint32_t generate_random_isn() noexcept {
-        // RFC 6528 / RFC 9293: Cryptographically unpredictable Initial Sequence Number
-        // Defends against off-path blind TCP injection, connection spoofing, and RST attacks.
-        thread_local std::mt19937_64 rng([]() {
+    static inline uint64_t rotl64(uint64_t x, int b) noexcept {
+        return (x << b) | (x >> (64 - b));
+    }
+
+    AETHON_ALWAYS_INLINE static uint32_t generate_siphash_isn(
+        uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport, uint64_t now_ns) noexcept {
+        struct Key { uint64_t k0; uint64_t k1; };
+        static const Key secret = []() {
             std::random_device rd;
-            return (static_cast<uint64_t>(rd()) << 32) ^ rd() ^
-                   static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-        }());
-        uint32_t val = static_cast<uint32_t>(rng());
-        return (val == 0) ? 1 : val; // Ensure non-zero ISN
+            return Key{
+                (static_cast<uint64_t>(rd()) << 32) | rd(),
+                (static_cast<uint64_t>(rd()) << 32) | rd()
+            };
+        }();
+
+        uint64_t v0 = 0x736f6d6570736575ULL ^ secret.k0;
+        uint64_t v1 = 0x646f72616e646f6dULL ^ secret.k1;
+        uint64_t v2 = 0x6c7967656e657261ULL ^ secret.k0;
+        uint64_t v3 = 0x7465646279746573ULL ^ secret.k1;
+
+        uint64_t m0 = static_cast<uint64_t>(saddr) | (static_cast<uint64_t>(daddr) << 32);
+        uint64_t m1 = static_cast<uint64_t>(sport) | (static_cast<uint64_t>(dport) << 16) | (static_cast<uint64_t>(12) << 56);
+
+        auto sipround = [&]() noexcept {
+            v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+            v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+        };
+
+        v3 ^= m0;
+        sipround();
+        sipround();
+        v0 ^= m0;
+
+        v3 ^= m1;
+        sipround();
+        sipround();
+        v0 ^= m1;
+
+        v2 ^= 0xff;
+        sipround();
+        sipround();
+        sipround();
+        sipround();
+
+        uint64_t hash = v0 ^ v1 ^ v2 ^ v3;
+        uint32_t clock_offset = static_cast<uint32_t>(now_ns / 4000);
+        uint32_t isn = static_cast<uint32_t>(hash) + clock_offset;
+        return (isn == 0) ? 1 : isn;
     }
 
     inline dns::DomainBlocklist g_domain_blocklist;
@@ -284,6 +324,22 @@ namespace pipeline {
         IPv4TcpAssembler::TcpAssemblyResult res = tcp_engine.process_packet(
             iph, tcph, payload, payload_len, now_ns);
 
+        if (AETHON_UNLIKELY(!res.session)) {
+            uint8_t flags = reinterpret_cast<const uint8_t *>(tcph)[13];
+            if ((flags & TH_RST) || (flags & TH_SYN)) {
+                return false;
+            }
+            if (!g_service_registry.is_managed_port(ntohs(tcph->dest))) {
+                return false;
+            }
+            if (flags & TH_FIN) {
+                return net::PacketInjector::ipv4_send_tcp_ack(
+                    sock, buf_addr, pkt, eth, iph, tcph, ntohl(tcph->ack_seq), ntohl(tcph->seq) + payload_len + 1, 0);
+            }
+            return net::PacketInjector::ipv4_send_tcp_rst(
+                sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+        }
+
         if (AETHON_UNLIKELY(res.fast_retransmit && res.session)) {
             // RFC 5681: Fast Retransmit sends single lost segment at snd_una without RTO backoff
             retransmit_unacked_data(sock, res.session, tx_pool, 1, false);
@@ -303,7 +359,8 @@ namespace pipeline {
             // RFC 6528: Only generate a new randomized ISN if this is a fresh handshake (server_isn == 0).
             // Retransmitted SYNs in SYN_SENT state reuse the existing server_isn without resetting sequence numbers!
             if (res.session->server_isn == 0) {
-                res.session->server_isn = generate_random_isn();
+                res.session->server_isn = generate_siphash_isn(
+                    iph->saddr, iph->daddr, tcph->source, tcph->dest, now_ns);
                 res.session->send_nxt = res.session->server_isn + 1;
                 res.session->snd_una = res.session->server_isn + 1;
             }
