@@ -155,6 +155,7 @@ void rx_worker(Engine &engine, int queue_id) {
 
   IPv4TcpAssembler::TcpAssemblerEngine tcp_assembler;
   auto scanner = g_master_scanner.create_worker();
+  pipeline::Ja3RateLimiter ja3_limiter;   // per-worker: no sharing, no locks (see tcp_pipeline.h)
 
 
   uint32_t idle_iters = 0;
@@ -314,7 +315,7 @@ void rx_worker(Engine &engine, int queue_id) {
                 std::chrono::steady_clock::now().time_since_epoch()).count();
 
                                     bool is_blocked = pipeline::handle_tcp_packet(
-                sock, desc->addr, pkt, eth, iph, ip_total_len, now_ns, tcp_assembler, scanner, tx_pool, epfd);
+                sock, desc->addr, pkt, eth, iph, ip_total_len, now_ns, tcp_assembler, scanner, tx_pool, epfd, ja3_limiter);
             if (AETHON_UNLIKELY(is_blocked)) {
               continue;
             }

@@ -19,6 +19,7 @@ enum class Event : uint8_t {
     RstBadClientHello,    // ClientHello too large or invalid record length
     RstBackendFailed,     // could not hand data to the backend (buffer full, socket error)
     RstTlsError,          // TLS decrypt / protocol error
+    Ja3RateLimited,       // ClientHello dropped: fingerprint over its per-worker rate limit
     SynCookieSent,        // SYN answered statelessly (table under pressure)
     SynCookieAccepted,    // connection created from a valid cookie
     SessionExpiredIdle,   // session purged after the idle timeout
@@ -29,6 +30,7 @@ enum class Event : uint8_t {
 inline constexpr std::array<const char *, static_cast<size_t>(Event::Count)> kEventNames{
     "tcp_bad_checksum", "rst_no_session", "rst_overlap_evasion", "rst_dpi_match",
     "rst_sni_blocked",  "rst_bad_client_hello", "rst_backend_failed", "rst_tls_error",
+    "ja3_rate_limited",
     "syn_cookie_sent",  "syn_cookie_accepted", "session_expired_idle", "session_rto_give_up",
 };
 

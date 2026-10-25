@@ -41,53 +41,68 @@
 
 namespace aethon {
 namespace pipeline {
-    /* JA3 RATE LIMITING DISABLED: kept for later, see the matching block in handle_tcp_packet().
-    static constexpr size_t MAX_JA3_IPS = 65536;
-    struct rate_lim_ja3{
-        std::atomic<uint16_t> tokens{0};
-        std::atomic<uint64_t> last_updated{0};
-        uint16_t limit{10};
-        uint64_t window{10};
+    // Per-worker JA3 rate limiter.
+    //
+    // The earlier design shared one SingleThreadHashMap across all four worker threads and relied
+    // on std::atomic fields inside the value. That is unsafe: the atomics only protect individual
+    // fields of a value you already own, but find()/insert() touch the map's own cells, probe chain
+    // and size_ (all plain, non-atomic) concurrently -> a data race (undefined behavior). insert()
+    // also copy-assigns the whole value, racing with another thread's atomic RMW on that same value
+    // and copying a 256 KB IP array on the packet path. The value was 256 KB per fingerprint and the
+    // limit was global, so every client of one TLS library (all curl, all Chrome) shared one counter.
+    //
+    // Aethon already keeps one session table per worker and a flow always returns to the same worker
+    // via RSS, so the correct design is a per-worker limiter: single-threaded, no atomics, no locks.
+    // The ceiling is therefore per-worker; with N queues one fingerprint can reach up to N x limit
+    // across all source IPs, which is acceptable for coarse flood control.
+    class Ja3RateLimiter {
+    public:
+        struct Config { uint32_t limit = 60; uint64_t window_ns = 10'000'000'000ULL; };
 
-        rate_lim_ja3() = default;
-        rate_lim_ja3(const rate_lim_ja3 &o) noexcept
-            : tokens(o.tokens.load(std::memory_order_relaxed)),
-              last_updated(o.last_updated.load(std::memory_order_relaxed)),
-              limit(o.limit), window(o.window) {}
-        rate_lim_ja3 &operator=(const rate_lim_ja3 &o) noexcept {
-            if (this != &o) {
-                tokens.store(o.tokens.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                last_updated.store(o.last_updated.load(std::memory_order_relaxed), std::memory_order_relaxed);
-                limit = o.limit;
-                window = o.window;
-            }
-            return *this;
-        }
-    };
-    struct ja3_ips{
-        uint32_t ips[MAX_JA3_IPS]{};
-        struct rate_lim_ja3 rate_lim{};
-        std::atomic<int> offset{0};
+        Ja3RateLimiter() : map_(4096) {}
+        explicit Ja3RateLimiter(Config cfg) : cfg_(cfg), map_(4096) {}
 
-        ja3_ips() = default;
-        ja3_ips(const ja3_ips &o) noexcept
-            : rate_lim(o.rate_lim),
-              offset(o.offset.load(std::memory_order_relaxed)) {
-            std::memcpy(ips, o.ips, sizeof(ips));
-        }
-        ja3_ips &operator=(const ja3_ips &o) noexcept {
-            if (this != &o) {
-                std::memcpy(ips, o.ips, sizeof(ips));
-                rate_lim = o.rate_lim;
-                offset.store(o.offset.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        // true => this ClientHello is over its fingerprint's limit and should be dropped
+        bool should_block(const tls::JA3 &fp, uint32_t src_ip, uint64_t now_ns) noexcept {
+            if (fp.curr_id <= 0) return false;          // no fingerprint (also the map's empty key)
+            Stat *s = map_.find(fp);
+            if (!s) {
+                if (map_.size() >= kMaxFingerprints) return false;   // table full: fail open
+                Stat fresh;
+                fresh.window_start_ns = now_ns;
+                fresh.count = 1;
+                fresh.sample_ips[0] = src_ip;
+                fresh.sample_count = 1;
+                map_.insert(fp, fresh);
+                return false;
             }
-            return *this;
+            if (now_ns - s->window_start_ns > cfg_.window_ns) {
+                s->window_start_ns = now_ns;
+                s->count = 0;
+                s->sample_count = 0;
+            }
+            ++s->count;
+            bool seen = false;
+            for (uint8_t i = 0; i < s->sample_count; ++i) if (s->sample_ips[i] == src_ip) { seen = true; break; }
+            if (!seen && s->sample_count < kSamples) s->sample_ips[s->sample_count++] = src_ip;
+            return s->count > cfg_.limit;
         }
+
+        size_t tracked() const noexcept { return map_.size(); }
+
+    private:
+        static constexpr uint8_t kSamples = 8;
+        static constexpr size_t kMaxFingerprints = 4000;   // < map capacity, bounds memory
+        struct Stat {
+            uint64_t window_start_ns{0};
+            uint32_t count{0};
+            uint32_t sample_ips[kSamples]{};   // a few distinct source IPs seen, for logging
+            uint8_t sample_count{0};
+        };
+        Config cfg_;
+        aethon::SingleThreadHashMap<tls::JA3, Stat> map_;
     };
-    using JA3_map = aethon::SingleThreadHashMap<aethon::tls::JA3, struct ja3_ips>;
-    inline JA3_map g_ja3_map{1024};
-    inline JA3_map* ja3_map{&g_ja3_map};
-    JA3 RATE LIMITING DISABLED (end) */
+
     AETHON_ALWAYS_INLINE void print_ip(uint32_t ip) noexcept {
         char buf[INET_ADDRSTRLEN];
         struct in_addr addr;
@@ -347,7 +362,8 @@ namespace pipeline {
         IPv4TcpAssembler::TcpAssemblerEngine & __restrict__ tcp_engine,
         Scanner & __restrict__ scanner,
         std::vector<uint64_t>&tx_pool ,
-    int epfd) noexcept
+    int epfd,
+        Ja3RateLimiter & __restrict__ ja3) noexcept
     {
         const size_t ip_hdr_len = iph->ihl * 4;
 
@@ -545,54 +561,15 @@ namespace pipeline {
 
             // Parse complete ClientHello to extract SNI and enforce domain policy
             auto tls_info = tls::parse_client_hello(hello_data, hello_len);
-            // bool exceed = false;   // JA3 rate limiting disabled (see below)
             if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(tls_info.is_client_hello, 1, 0.02)) {
-                /* JA3 RATE LIMITING DISABLED: kept for later. Before re-enabling: the map is shared by all
-                   worker threads without locking, the limit is global per fingerprint (all clients of one TLS
-                   library share a JA3), and each entry holds a 256 KB IP array.
-                if (ja3_map && tls_info.ja3_str.curr_id > 0) {
-                    auto *value = ja3_map->find(tls_info.ja3_str);
-                    if (AETHON_UNLIKELY(value)) {
-                        int off = value->offset.fetch_add(1, std::memory_order_relaxed);
-                        if (AETHON_LIKELY(off < static_cast<int>(MAX_JA3_IPS))) {
-                            value->ips[off] = iph->saddr;
-                        }
-                        const uint64_t window_ns = value->rate_lim.window * 1000000000ULL;
-                        uint64_t last = value->rate_lim.last_updated.load(std::memory_order_relaxed);
-                        if (now_ns - last > window_ns) {
-                            if (value->rate_lim.last_updated.compare_exchange_strong(last, now_ns, std::memory_order_relaxed)) {
-                                value->rate_lim.tokens.store(1, std::memory_order_relaxed);
-                            } else {
-                                if (value->rate_lim.tokens.fetch_add(1, std::memory_order_relaxed) >= value->rate_lim.limit) {
-                                    exceed = true;
-                                }
-                            }
-                        } else {
-                            if (value->rate_lim.tokens.fetch_add(1, std::memory_order_relaxed) >= value->rate_lim.limit) {
-                                exceed = true;
-                            }
-                        }
-                    } else {
-                        struct ja3_ips new_ip_list{};
-                        int off = new_ip_list.offset.fetch_add(1, std::memory_order_relaxed);
-                        new_ip_list.ips[off] = iph->saddr;
-                        new_ip_list.rate_lim.tokens.store(1, std::memory_order_relaxed);
-                        new_ip_list.rate_lim.window = 10;
-                        new_ip_list.rate_lim.limit = 10;
-                        new_ip_list.rate_lim.last_updated.store(now_ns, std::memory_order_relaxed);
-                        ja3_map->insert(tls_info.ja3_str, new_ip_list);
-                    }
+                // JA3 flood control: too many ClientHellos with the same fingerprint on this worker
+                if (AETHON_UNLIKELY(res.session && ja3.should_block(tls_info.ja3_str, iph->saddr, now_ns))) {
+                    stats::count(stats::Event::Ja3RateLimited);
+                    res.session->client_hello_buf.clear();
+                    tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                    return net::PacketInjector::ipv4_send_tcp_rst(
+                        sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                 }
-                if (AETHON_UNLIKELY(exceed)) {
-                    std::cout << "\n[IPS RATE-LIMIT] JA3 Fingerprint Limit Exceeded! Dropping ClientHello." << std::endl;
-                    std::cout << "  Attacker : ";
-                    print_ip(iph->saddr);
-                    std::cout << ":" << ntohs(tcph->source) << std::endl;
-                    std::cout << "  JA3      : " << tls_info.ja3() << std::endl;
-                    // Drop: false recycles the RX frame (true means "frame handed to TX" and would leak it)
-                    return false;
-                }
-                JA3 RATE LIMITING DISABLED (end) */
                 if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
                     std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
                     std::cout << "  Attacker : ";

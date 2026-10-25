@@ -74,6 +74,26 @@ target_link_libraries(test_dpi_rules PRIVATE
 )
 target_compile_options(test_dpi_rules PRIVATE -Wall -Wextra -Wno-interference-size)
 
+add_executable(test_ja3_ratelimit ../tests/test_ja3_ratelimit.cpp)
+target_include_directories(test_ja3_ratelimit PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/main
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/ebpf
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/dpi
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/transport
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${LIBXDP_INCLUDE_DIRS}
+    ${LIBBPF_INCLUDE_DIRS}
+    ${LIBHS_INCLUDE_DIRS}
+)
+target_link_libraries(test_ja3_ratelimit PRIVATE
+    aethon::aethon CLI11::CLI11
+    ${LIBXDP_LIBRARIES} ${LIBBPF_LIBRARIES} ${LIBHS_LIBRARIES}
+    OpenSSL::SSL OpenSSL::Crypto pthread)
+target_compile_options(test_ja3_ratelimit PRIVATE -Wall -Wextra -Wno-interference-size)
+
 add_executable(test_tcp_fuzz ../tests/test_tcp_fuzz.cpp)
 target_include_directories(test_tcp_fuzz PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
