@@ -4,6 +4,19 @@ import struct
 import time
 import random
 
+def check_SUM_ALL(data) :
+    m = []
+     for d in data :
+    
+        if len(data) %2 == 1 
+              data+=b'\0'
+        s = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+        s = (s >> 16) + (s & 0xffff)
+        s += s >> 16
+        m.append(~s & 0xffff)
+    
+    
+
 def checksum(data):
     if len(data) % 2 == 1:
         data += b'\0'
